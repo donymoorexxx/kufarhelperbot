@@ -1,4 +1,9 @@
-// Kufar monitor — Telegram-бот на Cloudflare Workers (webhook + Cron + D1)
+// Kufar monitor — Telegram-бот + Mini App на Cloudflare Workers (webhook + Cron + D1)
+
+import APP_HTML from "./app.html";
+import { handleApi } from "./api.js";
+
+let APP_URL = ""; // адрес воркера, нужен для кнопок открытия Mini App
 
 const MAX_CATS_PER_RUN = 3; // сколько категорий проверять за один запуск cron
 const MAX_SENDS = 10; // максимум уведомлений на категорию за проверку
@@ -37,6 +42,9 @@ async function ensureSchema(env) {
     p(`CREATE TABLE IF NOT EXISTS history(
       id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, ad_id TEXT, title TEXT, price TEXT, url TEXT, ts INTEGER)`),
   ]);
+  try {
+    await env.DB.prepare("ALTER TABLE categories ADD COLUMN cat_key TEXT").run();
+  } catch {} // колонка уже есть
   schemaReady = true;
 }
 
@@ -96,9 +104,10 @@ async function view(env, cb, text, markup) {
 
 const mainMenu = () =>
   kb([
+    [{ text: "📱 Открыть Kufar Helper", web_app: { url: APP_URL } }],
     [B("🔎 Начать мониторинг", "menu:start")],
     [B("📂 Мои категории", "menu:cats")],
-    [B("➕ Добавить категорию", "menu:add")],
+    [{ text: "➕ Добавить категорию", web_app: { url: APP_URL } }],
     [B("⚙️ Настройки", "menu:settings")],
     [B("📋 История объявлений", "menu:history")],
     [B("⏸ Приостановить мониторинг", "menu:pause")],
@@ -488,6 +497,16 @@ async function runMonitor(env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    APP_URL = url.origin;
+
+    if (url.pathname === "/" || url.pathname === "/app") {
+      return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      await ensureSchema(env);
+      return handleApi(request, env, url, { prep, all, one, run, fetchAds, ensureUser });
+    }
 
     if (url.pathname === "/webhook" && request.method === "POST") {
       if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
@@ -520,6 +539,7 @@ export default {
         drop_pending_updates: true,
       });
       await tg(env, "setMyCommands", { commands: [{ command: "start", description: "Главное меню" }] });
+      await tg(env, "setChatMenuButton", { menu_button: { type: "web_app", text: "Kufar", web_app: { url: url.origin } } });
       return new Response(j.ok ? "✅ Webhook установлен. Напиши боту /start" : "❌ " + JSON.stringify(j), {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
