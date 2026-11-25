@@ -1,0 +1,10 @@
+{
+  "name": "kufar-bot",
+  "main": "index.js",
+  "compatibility_date": "2026-11-01",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "kufar-bot-db" }
+  ],
+  "triggers": { "crons": ["* * * * *"] },
+  "observability": { "enabled": true }
+}
