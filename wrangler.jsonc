@@ -1,5 +1,5 @@
 {
-  "name": "kufar-bot",
+  "name": "kufarhelperbot",
   "main": "index.js",
   "compatibility_date": "2026-11-01",
   "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
