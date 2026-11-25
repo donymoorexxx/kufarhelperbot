@@ -6,7 +6,8 @@
 // достаточно поправить её path здесь. Проверка всех адресов: /api/diag?key=<WEBHOOK_SECRET>
 
 const CATEGORIES = [
-  { id: "phones", name: "Телефоны", icon: "📱", group: "Электроника", path: "telefony" },
+  { id: "phones", name: "Мобильные телефоны", icon: "📱", group: "Электроника", path: "mobilnye-telefony" },
+  { id: "phonetab", name: "Телефоны и планшеты (всё)", icon: "📞", group: "Электроника", path: "telefony-i-planshety" },
   { id: "laptops", name: "Ноутбуки", icon: "💻", group: "Электроника", path: "noutbuki" },
   { id: "tablets", name: "Планшеты", icon: "📲", group: "Электроника", path: "planshety" },
   { id: "computers", name: "Компьютерная техника", icon: "🖥️", group: "Электроника", path: "kompyuternaya-tehnika" },
@@ -42,11 +43,17 @@ const CATEGORIES = [
 const REGIONS = [
   { id: "all", name: "Вся Беларусь", path: "" },
   { id: "minsk", name: "Минск", path: "r~minsk" },
+  { id: "minskobl", name: "Минская обл.", path: "r~minskaya-obl" },
   { id: "brest", name: "Брест", path: "r~brest" },
+  { id: "brestobl", name: "Брестская обл.", path: "r~brestskaya-obl" },
   { id: "vitebsk", name: "Витебск", path: "r~vitebsk" },
+  { id: "vitebskobl", name: "Витебская обл.", path: "r~vitebskaya-obl" },
   { id: "gomel", name: "Гомель", path: "r~gomel" },
+  { id: "gomelobl", name: "Гомельская обл.", path: "r~gomelskaya-obl" },
   { id: "grodno", name: "Гродно", path: "r~grodno" },
+  { id: "grodnoobl", name: "Гродненская обл.", path: "r~grodnenskaya-obl" },
   { id: "mogilev", name: "Могилёв", path: "r~mogilev" },
+  { id: "mogilevobl", name: "Могилёвская обл.", path: "r~mogilevskaya-obl" },
 ];
 
 function buildUrl(cat, region) {
@@ -145,9 +152,28 @@ export async function handleApi(request, env, url, H) {
       });
     }
 
+    // Список ссылок /l/... со страницы Kufar: /api/discover?key=<WEBHOOK_SECRET>&url=https://www.kufar.by/
+    if (path === "/api/discover") {
+      if (!env.WEBHOOK_SECRET || url.searchParams.get("key") !== env.WEBHOOK_SECRET) throw new HttpError("forbidden", 403);
+      const target = url.searchParams.get("url") || "https://www.kufar.by/";
+      if (!/^https:\/\/(www\.)?kufar\.by\//.test(target)) throw new HttpError("Нужен адрес kufar.by");
+      const r = await fetch(target, { headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "ru-RU" } });
+      const html = await r.text();
+      const found = new Map();
+      const re = /<a[^>]+href="(?:https:\/\/www\.kufar\.by)?(\/l\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/g;
+      let m;
+      while ((m = re.exec(html)) && found.size < 300) {
+        const text = m[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+        if (!found.has(m[1])) found.set(m[1], text);
+      }
+      const lines = [...found].map(([p, t]) => `${p}  —  ${t}`);
+      return new Response(`HTTP ${r.status}, ссылок /l/: ${lines.length}\n\n${lines.join("\n")}`, { headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+
     // Всё остальное — только из Telegram
     const tgUser = await verifyInitData(request.headers.get("X-Init-Data"), env.BOT_TOKEN);
     const uid = tgUser.id;
+    const now = Math.floor(Date.now() / 1000);
     const user = await ensureUser(env, uid);
     const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
 
@@ -166,23 +192,30 @@ export async function handleApi(request, env, url, H) {
       const count = (await one(env, "SELECT COUNT(*) c FROM categories WHERE tg_id=?", uid)).c;
       if (count >= MAX_CATEGORIES_PER_USER) throw new HttpError(`Не больше ${MAX_CATEGORIES_PER_USER} категорий`);
       const fields = cleanFields({ interval: user.interval, ...(body.filters || {}) });
+      const onlyNew = body.only_new !== false;
       const catUrl = buildUrl(cat, region);
       let ads;
       try {
         ads = await fetchAds(catUrl);
       } catch (e) {
-        throw new HttpError(`Не удалось открыть категорию на Kufar: ${e.message}`, 502);
+        const gone = /404/.test(e.message);
+        throw new HttpError(
+          gone ? "Kufar не нашёл такую страницу: адрес этой категории или региона изменился. Выбери другую." : `Не удалось открыть категорию на Kufar: ${e.message}`,
+          502
+        );
       }
       const title = region.id === "all" ? cat.name : `${cat.name} · ${region.name}`;
       const res = await run(
         env,
-        "INSERT INTO categories(tg_id,url,title,cat_key,min_price,max_price,city,keywords,exclude,interval) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO categories(tg_id,url,title,cat_key,min_price,max_price,city,keywords,exclude,interval,since) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         uid, catUrl, title, cat.id,
         fields.min_price ?? null, fields.max_price ?? null, fields.city ?? null,
-        fields.keywords ?? null, fields.exclude ?? null, fields.interval
+        fields.keywords ?? null, fields.exclude ?? null, fields.interval,
+        onlyNew ? now : null
       );
       const id = res.meta.last_row_id;
-      if (ads.length) await env.DB.batch(ads.map((a) => prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", id, a.id)));
+      // «только новые»: всё, что уже есть на странице, считаем просмотренным
+      if (onlyNew && ads.length) await env.DB.batch(ads.map((a) => prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", id, a.id)));
       return json({ ok: true, id, existing: ads.length });
     }
 
@@ -198,7 +231,13 @@ export async function handleApi(request, env, url, H) {
     }
 
     if (path === "/api/toggle") {
-      await run(env, "UPDATE categories SET active=1-active WHERE id=? AND tg_id=?", body.id, uid);
+      const cur = await one(env, "SELECT active FROM categories WHERE id=? AND tg_id=?", body.id, uid);
+      if (!cur) throw new HttpError("Категория не найдена", 404);
+      if (cur.active) await run(env, "UPDATE categories SET active=0 WHERE id=? AND tg_id=?", body.id, uid);
+      else {
+        // при включении: skip_old=true — пропустить объявления, появившиеся за время паузы
+        await run(env, "UPDATE categories SET active=1, since=?, last_check=0 WHERE id=? AND tg_id=?", body.skip_old ? now : null, body.id, uid);
+      }
       return json({ ok: true });
     }
 
@@ -211,7 +250,12 @@ export async function handleApi(request, env, url, H) {
     }
 
     if (path === "/api/settings") {
-      if ("paused" in body) await run(env, "UPDATE users SET paused=? WHERE tg_id=?", body.paused ? 1 : 0, uid);
+      if ("paused" in body) {
+        await run(env, "UPDATE users SET paused=? WHERE tg_id=?", body.paused ? 1 : 0, uid);
+        if (!body.paused) {
+          await run(env, "UPDATE categories SET since=?, last_check=0 WHERE tg_id=? AND active=1", body.skip_old ? now : null, uid);
+        }
+      }
       if ("interval" in body) {
         const { interval } = cleanFields({ interval: body.interval });
         await run(env, "UPDATE users SET interval=? WHERE tg_id=?", interval, uid);

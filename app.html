@@ -210,6 +210,7 @@ function sheetHtml() {
   return '<div class="overlay" data-act="close"></div><div class="sheet"><div class="grab"></div>' +
     '<div class="title" style="font-size:19px">' + title + "</div>" +
     (adding ? '<div class="lbl">Регион</div><div class="chips big">' + S.regions.map((r) => '<button class="chip ' + (sh.region === r.id ? "sel" : "") + '" data-act="region" data-id="' + r.id + '">' + esc(r.name) + "</button>").join("") + "</div>" : "") +
+    (adding ? '<div class="card" style="margin:16px 0 0;box-shadow:none;background:var(--bg)"><div class="row"><div class="grow"><div class="title">Не присылать старые</div><div class="sub">' + (sh.only_new ? "Только объявления, появившиеся после включения" : "Сначала пришлю самые свежие из уже опубликованных") + '</div></div><div class="switch ' + (sh.only_new ? "on" : "") + '" data-act="onlynew"></div></div></div>' : "") +
     '<div class="lbl">Цена, BYN</div><div class="two"><input class="inp" inputmode="decimal" data-f="min_price" placeholder="от" value="' + esc(f.min_price) + '"><input class="inp" inputmode="decimal" data-f="max_price" placeholder="до" value="' + esc(f.max_price) + '"></div>' +
     '<div class="lbl">Город содержит</div><input class="inp" data-f="city" placeholder="например, Минск" value="' + esc(f.city) + '">' +
     '<div class="lbl">Ключевые слова</div><input class="inp" data-f="keywords" placeholder="iphone, 128gb" value="' + esc(f.keywords) + '"><div class="hint">Через запятую. Достаточно любого из слов</div>' +
@@ -242,7 +243,7 @@ function render() {
 
 function openAdd(id) {
   const cat = S.cats.find((c) => c.id === id);
-  S.sheet = { mode: "add", cat, region: "all", f: { min_price: "", max_price: "", city: "", keywords: "", exclude: "", interval: S.user.interval } };
+  S.sheet = { mode: "add", cat, region: "all", only_new: true, f: { min_price: "", max_price: "", city: "", keywords: "", exclude: "", interval: S.user.interval } };
   render();
 }
 function openEdit(id) {
@@ -251,6 +252,17 @@ function openEdit(id) {
     min_price: c.min_price == null ? "" : c.min_price, max_price: c.max_price == null ? "" : c.max_price,
     city: c.city || "", keywords: c.keywords || "", exclude: c.exclude || "", interval: c.interval } };
   render();
+}
+
+// Вопрос при включении мониторинга: пропустить объявления, появившиеся за время паузы?
+function askResume(cb) {
+  const msg = "Что сделать с объявлениями, которые появились, пока мониторинг был выключен?";
+  if (tg && tg.showPopup) {
+    tg.showPopup({ title: "Включить мониторинг", message: msg, buttons: [
+      { id: "new", type: "default", text: "Только новые" },
+      { id: "all", type: "default", text: "Прислать пропущенные" },
+      { type: "cancel" }] }, (id) => { if (id === "new") cb(true); else if (id === "all") cb(false); });
+  } else cb(confirm(msg + "\nOK = только новые, Отмена = прислать пропущенные"));
 }
 
 async function run(fn) {
@@ -268,7 +280,10 @@ document.addEventListener("click", (e) => {
   const act = el.dataset.act, id = el.dataset.id, v = el.dataset.v;
   if (act === "toggle") {
     e.stopPropagation();
-    return run(async () => { await api("toggle", { id: Number(id) }); const c = S.mine.find((x) => x.id === Number(id)); c.active = c.active ? 0 : 1; render(); });
+    const c = S.mine.find((x) => x.id === Number(id));
+    const apply = (skip) => run(async () => { await api("toggle", { id: c.id, skip_old: skip }); c.active = c.active ? 0 : 1; haptic(); render(); });
+    if (c.active) return apply(false);
+    return askResume((skip) => apply(skip));
   }
   if (act === "tab") { S.tab = v; S.sheet = null; render(); window.scrollTo(0, 0); }
   else if (act === "reload") { S.ready = false; render(); load(); }
@@ -278,12 +293,16 @@ document.addEventListener("click", (e) => {
   else if (act === "region") { S.sheet.region = id; render(); }
   else if (act === "fint") { S.sheet.f.interval = Number(v); render(); }
   else if (act === "open") { const h = S.history[Number(el.dataset.i)]; if (tg && tg.openLink) tg.openLink(h.url); else window.open(h.url, "_blank"); }
-  else if (act === "pause") run(async () => { await api("settings", { paused: !S.user.paused }); S.user.paused = !S.user.paused; haptic(); render(); });
+  else if (act === "onlynew") { S.sheet.only_new = !S.sheet.only_new; render(); }
+  else if (act === "pause") {
+    const set = (paused, skip) => run(async () => { await api("settings", { paused, skip_old: skip }); S.user.paused = paused; haptic(); render(); });
+    if (!S.user.paused) set(true, false); else askResume((skip) => set(false, skip));
+  }
   else if (act === "definterval") run(async () => { await api("settings", { interval: Number(v) }); S.user.interval = Number(v); haptic(); render(); });
   else if (act === "save") run(async () => {
     S.saving = true; render();
     const sh = S.sheet;
-    if (sh.mode === "add") await api("subscribe", { category: sh.cat.id, region: sh.region, filters: sh.f });
+    if (sh.mode === "add") await api("subscribe", { category: sh.cat.id, region: sh.region, filters: sh.f, only_new: sh.only_new });
     else await api("update", { id: sh.id, fields: sh.f });
     const st = await api("state"); S.mine = st.categories; S.history = st.history;
     S.saving = false; S.sheet = null; if (sh.mode === "add") S.tab = "mine";

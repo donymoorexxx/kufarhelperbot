@@ -42,9 +42,11 @@ async function ensureSchema(env) {
     p(`CREATE TABLE IF NOT EXISTS history(
       id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, ad_id TEXT, title TEXT, price TEXT, url TEXT, ts INTEGER)`),
   ]);
-  try {
-    await env.DB.prepare("ALTER TABLE categories ADD COLUMN cat_key TEXT").run();
-  } catch {} // колонка уже есть
+  for (const col of ["cat_key TEXT", "since INTEGER"]) {
+    try {
+      await env.DB.prepare(`ALTER TABLE categories ADD COLUMN ${col}`).run();
+    } catch {} // колонка уже есть
+  }
   schemaReady = true;
 }
 
@@ -331,7 +333,21 @@ async function onCallback(env, cb) {
       return view(env, cb, "Главное меню:", mainMenu());
 
     case "menu:start": {
+      if (user.paused) {
+        return view(
+          env, cb,
+          "▶️ Включаю мониторинг. Что сделать с объявлениями, которые появились, пока он был выключен?",
+          kb([[B("Только новые", "resume:new")], [B("Прислать пропущенные", "resume:all")], backRow])
+        );
+      }
+      const n0 = (await one(env, "SELECT COUNT(*) c FROM categories WHERE tg_id=? AND active=1", id)).c;
+      return view(env, cb, `🔎 Мониторинг уже работает. Активных категорий: ${n0}`, mainMenu());
+    }
+
+    case "resume": {
+      const now = Math.floor(Date.now() / 1000);
       await run(env, "UPDATE users SET paused=0 WHERE tg_id=?", id);
+      await run(env, "UPDATE categories SET since=?, last_check=0 WHERE tg_id=? AND active=1", b === "new" ? now : null, id);
       const n = (await one(env, "SELECT COUNT(*) c FROM categories WHERE tg_id=? AND active=1", id)).c;
       return view(
         env, cb,
@@ -457,7 +473,13 @@ async function checkCategory(env, cat) {
 
   await env.DB.batch(fresh.map((a) => prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, a.id)));
 
-  const toSend = fresh.slice(0, MAX_SENDS).reverse().filter((a) => passes(a, cat));
+  // since: не присылать объявления, опубликованные раньше момента включения мониторинга
+  const notOld = (a) => {
+    if (!cat.since || !a.date) return true;
+    const t = Date.parse(a.date) / 1000;
+    return !Number.isFinite(t) || t >= cat.since;
+  };
+  const toSend = fresh.slice(0, MAX_SENDS).reverse().filter((a) => notOld(a) && passes(a, cat));
   const hist = [];
   for (const ad of toSend) {
     if (await sendAd(env, cat.tg_id, ad)) {
