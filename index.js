@@ -161,11 +161,15 @@ async function fetchAds(url) {
   return found.map(normalize).filter((a) => !seen.has(a.id) && seen.add(a.id));
 }
 
-function findPrice(node) {
-  if (Array.isArray(node)) { for (const n of node) { const v = findPrice(n); if (v != null) return v; } return null; }
+// Цена именно этого объявления (а не похожих на странице): ищем объект с тем же ad_id
+function findPrice(node, adId) {
+  if (Array.isArray(node)) { for (const n of node) { const v = findPrice(n, adId); if (v != null) return v; } return null; }
   if (node && typeof node === "object") {
-    if ("price_byn" in node) { const p = Number(node.price_byn); return p > 0 ? p / 100 : null; }
-    for (const n of Object.values(node)) { const v = findPrice(n); if (v != null) return v; }
+    if ("price_byn" in node && String(node.ad_id ?? node.adId ?? node.id) === String(adId)) {
+      const p = Number(node.price_byn);
+      return p > 0 ? p / 100 : null;
+    }
+    for (const n of Object.values(node)) { const v = findPrice(n, adId); if (v != null) return v; }
   }
   return null;
 }
@@ -202,9 +206,9 @@ async function sendAd(env, chat, ad, text, markup, silent) {
     const j = await tg(env, "sendPhoto", {
       chat_id: chat, photo: ad.photo, caption: text, parse_mode: "HTML", reply_markup: markup, disable_notification: !!silent,
     });
-    if (j.ok) return true;
+    if (j.ok) return j;
   }
-  return (await send(env, chat, text, markup, silent)).ok;
+  return send(env, chat, text, markup, silent);
 }
 
 // ───────────────────────── Чат с ботом ─────────────────────────
@@ -325,7 +329,9 @@ async function onCallback(env, cb) {
 
 async function checkCategory(env, cat) {
   const now = Math.floor(Date.now() / 1000);
-  await run(env, "UPDATE categories SET last_check=? WHERE id=?", now, cat.id);
+  // захватываем категорию: если другой запуск Cron уже взял её, пропускаем
+  const claim = await run(env, "UPDATE categories SET last_check=? WHERE id=? AND last_check + interval*60 <= ?", now, cat.id, now);
+  if (claim.meta.changes === 0) return;
 
   let ads;
   try { ads = await fetchAds(cat.url); } catch (e) { console.log("fetch failed", cat.id, e.message); return; }
@@ -348,6 +354,16 @@ async function checkCategory(env, cat) {
   });
   if (!fresh.length && !changed.length) return;
 
+  const silent = !!user?.quiet;
+  const fwd = user?.forward_chat;
+  const notOld = (a) => {
+    if (!cat.since || !a.date) return true;
+    const t = Date.parse(a.date) / 1000;
+    return !Number.isFinite(t) || t >= cat.since;
+  };
+  const toSend = fresh.slice(0, MAX_SENDS).reverse().filter((a) => notOld(a) && passes(a, cat, user));
+  const deferred = new Set(toSend.map((a) => a.id)); // «просмотренными» станут только после успешной отправки
+
   const pool = await all(env, "SELECT ad_id,title,price,sig,dsig,seller,first_seen FROM ads WHERE market=? ORDER BY first_seen DESC LIMIT 600", market);
   const stmts = [];
   const meta = new Map();
@@ -364,7 +380,7 @@ async function checkCategory(env, cat) {
       if (a.price != null) stmts.push(prep(env, "INSERT INTO price_hist VALUES(?,?,?)", a.id, a.price, now));
       pool.unshift({ ad_id: a.id, title: a.title, price: a.price, sig, dsig, seller: a.seller, first_seen: now });
     }
-    stmts.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, a.id));
+    if (!deferred.has(a.id)) stmts.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, a.id));
     meta.set(a.id, { sc, rp });
   }
 
@@ -378,16 +394,7 @@ async function checkCategory(env, cat) {
   }
   await batchChunks(env, stmts);
 
-  const silent = !!user?.quiet;
-  const fwd = user?.forward_chat;
-  const notOld = (a) => {
-    if (!cat.since || !a.date) return true;
-    const t = Date.parse(a.date) / 1000;
-    return !Number.isFinite(t) || t >= cat.since;
-  };
-
   // новые объявления
-  const toSend = fresh.slice(0, MAX_SENDS).reverse().filter((a) => notOld(a) && passes(a, cat, user));
   const hist = [];
   for (const ad of toSend) {
     const { sc, rp } = meta.get(ad.id);
@@ -395,10 +402,17 @@ async function checkCategory(env, cat) {
       ? `🔁 Вероятная повторная публикация (${rp.kind === "repost" ? "тот же продавец" : "похожее объявление другого продавца"}). Раньше замечено: ${fmtDate(rp.row.first_seen * 1000)}, цена тогда: ${money(rp.row.price)}`
       : "";
     const text = adCard(ad, sc, extra);
-    if (await sendAd(env, cat.tg_id, ad, text, adButtons(env, ad), silent)) {
+    const res = await sendAd(env, cat.tg_id, ad, text, adButtons(env, ad), silent);
+    if (res.ok) {
+      hist.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, ad.id));
       hist.push(prep(env, "INSERT INTO history(tg_id,ad_id,title,price,url,ts) VALUES(?,?,?,?,?,?)", cat.tg_id, ad.id, ad.title, priceStr(ad), ad.url, now));
       if (fwd) await sendAd(env, fwd, ad, text, kb([[{ text: "Открыть на Kufar", url: ad.url }]]), true);
+    } else if (res.error_code === 403) {
+      // пользователь заблокировал бота: ставим мониторинг на паузу, чтобы не долбиться впустую
+      hist.push(prep(env, "UPDATE users SET paused=1 WHERE tg_id=?", cat.tg_id));
+      break;
     }
+    // иначе объявление остаётся непросмотренным и придёт при следующей проверке
   }
 
   // изменения цены: для избранного в обе стороны, для остальных только снижение от 10%
@@ -411,7 +425,7 @@ async function checkCategory(env, cat) {
       const change = (d.a.price - d.old) / d.old;
       if (!(favSet.has(d.a.id) || (change <= -0.1 && seen.has(d.a.id) && passes(d.a, cat, user)))) continue;
       const text = `${priceChangeBlock(d.old, d.a.price)}\n\n<b>${esc(d.a.title)}</b>\n📍 ${esc(d.a.city || "—")}\n\n${scoreBlock(d.a, d.sc)}`;
-      if (await sendAd(env, cat.tg_id, d.a, text, adButtons(env, d.a), silent)) n++;
+      if ((await sendAd(env, cat.tg_id, d.a, text, adButtons(env, d.a), silent)).ok) n++;
     }
   }
 
@@ -437,7 +451,7 @@ async function refreshFavorite(env) {
   const m = (await r.text()).match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (!m) return;
   let price = null;
-  try { price = findPrice(JSON.parse(m[1])); } catch {}
+  try { price = findPrice(JSON.parse(m[1]), f.ad_id); } catch {}
   if (price == null || f.price == null || Math.abs(price - f.price) < 0.01) return;
   await env.DB.batch([
     prep(env, "UPDATE ads SET price=? WHERE ad_id=?", price, f.ad_id),
