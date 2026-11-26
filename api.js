@@ -1,5 +1,6 @@
 // API для Telegram Mini App + каталог категорий. Авторизация — по подписанному initData от Telegram.
 
+import { HttpError, handleAdmin, getSetting, aiAvailable, logEvent } from "./core.js";
 import {
   passes, rowToAd, scoreAd, analogsFor, sigOf, dsigOf, median, mean, jaccard, toCsv, parseFilter, tokens, phraseMatch,
 } from "./logic.js";
@@ -57,9 +58,6 @@ const MAX_CATEGORIES_PER_USER = 20;
 const enc = new TextEncoder();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class HttpError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
-}
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8" } });
 
@@ -166,9 +164,21 @@ export async function handleApi(request, env, url, H) {
     const tgUser = await verifyInitData(request.headers.get("X-Init-Data"), env.BOT_TOKEN);
     const uid = tgUser.id;
     const now = Math.floor(Date.now() / 1000);
-    const user = await ensureUser(env, uid);
+    const owner = !!env.OWNER_TELEGRAM_ID && String(uid) === String(env.OWNER_TELEGRAM_ID); // проверка прав только на сервере
+    const user = await ensureUser(env, uid, tgUser);
+    if (user.blocked && !owner) throw new HttpError("Доступ ограничен администратором", 403);
+    if (!owner && (await getSetting(env, "maintenance", "0")) === "1") throw new HttpError("Идут технические работы. Мониторинг продолжает работать, приложение скоро вернётся.", 503);
+    if (!user.last_seen || now - user.last_seen > 3600) await logEvent(env, "login", uid, tgUser.username ? "@" + tgUser.username : tgUser.first_name || "");
     const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
     const q = url.searchParams;
+
+    if (path.startsWith("/api/admin/")) {
+      if (!owner) {
+        await logEvent(env, "security", uid, `попытка доступа к админке: ${path}`);
+        throw new HttpError("Нет доступа", 403);
+      }
+      return json(await handleAdmin(env, uid, path, request.method, q, body));
+    }
 
     // Объявления пользователя (видны ему по его категориям) с фильтрами категории
     const userAds = async (limit = 300) => {
@@ -191,7 +201,7 @@ export async function handleApi(request, env, url, H) {
       return json({
         user: {
           paused: !!user.paused, interval: user.interval, name: tgUser.first_name || "", quiet: !!user.quiet, report: user.report || "off",
-          forward_chat: user.forward_chat || null, bl_words: user.bl_words || "", bl_sellers: user.bl_sellers || "", ai: !!env.ANTHROPIC_API_KEY,
+          forward_chat: user.forward_chat || null, bl_words: user.bl_words || "", bl_sellers: user.bl_sellers || "", ai: await aiAvailable(env), owner,
         },
         categories,
         stats: { found24: f24.c, favs: favs.c, active: categories.filter((c) => c.active).length },
@@ -435,15 +445,15 @@ export async function handleApi(request, env, url, H) {
       const row = await one(env, "SELECT * FROM ads WHERE ad_id=?", String(body.id || ""));
       if (!row) throw new HttpError("Объявление не найдено", 404);
       try {
-        return json({ html: aiText(await analyzeAd(env, rowToAd(row))) });
-      } catch (e) { throw new HttpError(e.message, 503); }
+        return json({ html: aiText(await analyzeAd(env, row, uid)) });
+      } catch (e) { throw new HttpError(e.message, e.status || 503); }
     }
 
     if (path === "/api/nl") {
       const text = String(body.text || "").trim().slice(0, 500);
       if (!text) throw new HttpError("Напиши, что искать");
       let f;
-      try { f = await parseFilter(env, text, CATEGORIES, REGIONS); } catch (e) { throw new HttpError(e.message, 503); }
+      try { f = await parseFilter(env, text, CATEGORIES, REGIONS, uid); } catch (e) { throw new HttpError(e.message, e.status || 503); }
       const list = (a) => (Array.isArray(a) ? a.map(String).join(", ") : "");
       return json({
         category: CATEGORIES.find((c) => c.id === f.category)?.id || null,
@@ -462,6 +472,7 @@ export async function handleApi(request, env, url, H) {
   } catch (e) {
     if (e instanceof HttpError) return json({ error: e.message }, e.status);
     console.log("api error", e.message, e.stack);
+    await logEvent(env, "api_error", null, `${new URL(request.url).pathname}: ${e.message}`);
     return json({ error: "Внутренняя ошибка" }, 500);
   }
 }

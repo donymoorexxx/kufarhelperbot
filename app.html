@@ -71,6 +71,11 @@
   .toast{position:fixed;left:50%;bottom:calc(92px + var(--safe-b));transform:translateX(-50%);z-index:40;background:#1c212b;color:#fff;padding:11px 16px;border-radius:12px;font-size:14px;max-width:90%;text-align:center;animation:fade .2s}
   .center{min-height:60vh;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
   .menu .card{display:flex;align-items:center;gap:12px;width:100%;text-align:left}.menu .ic{font-size:24px}
+  .bar{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--price)}
+  .bar i.warn{background:var(--warn)}.bar i.warn2{background:#e8590c}.bar i.bad{background:var(--danger)}
+  .chips.scroll{flex-wrap:nowrap;overflow-x:auto;margin-left:-4px;padding:0 4px 4px}.chips.scroll .chip{white-space:nowrap}
+  .mini{font-size:12px;color:var(--muted);margin-top:4px}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  select.inp{appearance:none}
   .check{width:22px;height:22px;border-radius:7px;border:2px solid var(--line);flex:none;display:grid;place-items:center;font-size:14px;color:#fff}.check.on{background:var(--accent);border-color:var(--accent)}
 </style>
 </head>
@@ -88,7 +93,7 @@ function applyTheme(p) {
 applyTheme(themePref);
 
 const S = { tab: "home", sub: null, ready: false, error: null, cats: [], regions: [], mine: [], user: {}, stats: {}, theme: themePref,
-  feed: [], feedTotal: 0, feedMode: "best", sort: "score", q: "", home: [], favs: [], an: null, anDays: 30, sheet: null, bulk: false, sel: new Set(), saving: false, nl: null, nlText: "", catQ: "" };
+  feed: [], feedTotal: 0, feedMode: "best", sort: "score", q: "", home: [], favs: [], an: null, anDays: 30, sheet: null, bulk: false, sel: new Set(), saving: false, nl: null, nlText: "", catQ: "", adm: { sec: "dash", period: "7d", data: null, err: null, q: "", offset: 0, type: "", user: "", from: "", to: "", bctext: "", bcaud: "all", bcprev: null } };
 const INTERVALS = [1, 5, 10, 30, 60];
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -118,6 +123,14 @@ async function load() {
 async function loadFeed() { const j = await api("feed?mode=" + S.feedMode + "&sort=" + S.sort + "&q=" + encodeURIComponent(S.q)); S.feed = j.items; S.feedTotal = j.total; }
 async function loadFavs() { S.favs = (await api("favs")).items; }
 async function loadAn() { S.an = await api("analytics?days=" + S.anDays); }
+async function loadAdmin() {
+  const a = S.adm, qs = (o) => Object.entries(o).filter(([, v]) => v !== "" && v != null).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+  const paths = { dash: "admin/dashboard?period=" + a.period, users: "admin/users?" + qs({ q: a.q, offset: a.offset }), ai: "admin/ai", mon: "admin/monitoring", res: "admin/resources",
+    fin: "admin/finance", bc: "admin/broadcast", logs: "admin/logs?" + qs({ type: a.type, user: a.user, from: a.from, to: a.to }), set: "admin/settings" };
+  a.err = null;
+  try { a.data = await api(paths[a.sec]); } catch (e) { a.data = null; a.err = e.message; }
+  render();
+}
 async function refreshState() { const st = await api("state"); S.mine = st.categories; S.user = st.user; S.stats = st.stats; }
 
 const iconOf = (key) => (S.cats.find((c) => c.id === key) || {}).icon || "🛍️";
@@ -229,9 +242,10 @@ function viewMore() {
   if (S.sub === "analytics") return viewAnalytics();
   if (S.sub === "nl") return viewNl();
   if (S.sub === "settings") return viewSettings();
+  if (S.sub === "admin" && S.user.owner) return viewAdmin();
   const item = (ic, t, s, act) => '<button class="card" data-act="' + act + '"><span class="ic">' + ic + '</span><div class="grow"><div class="title">' + t + '</div><div class="sub">' + s + "</div></div></button>";
   return '<h2>Ещё</h2><div class="menu">' + item("📊", "Аналитика", "Цены, медиана, динамика по твоим категориям", "goan") + item("🧠", "Умный фильтр", "Опиши, что ищешь, обычными словами", "gonl") +
-    item("📤", "Экспорт в CSV", "Файл с объявлениями придёт в чат (открывается в Excel)", "export") + item("⚙️", "Настройки", "Уведомления, тихий режим, чёрные списки, тема", "gosettings") + "</div>";
+    item("📤", "Экспорт в CSV", "Файл с объявлениями придёт в чат (открывается в Excel)", "export") + item("⚙️", "Настройки", "Уведомления, тихий режим, чёрные списки, тема", "gosettings") + (S.user.owner ? item("🛡", "Админ-панель", "Пользователи, AI, мониторинг, ресурсы, рассылки, логи", "goadmin") : "") + "</div>";
 }
 
 function viewAnalytics() {
@@ -261,7 +275,7 @@ function viewNl() {
   }
   return '<div class="h2row"><h2>Умный фильтр</h2><button class="btn ghost sm" data-act="backmore">Назад</button></div><textarea class="inp" id="nlt" placeholder="Например: iPhone 15 Pro в Минске до 1500 рублей, в хорошем состоянии, без разбитых">' + esc(S.nlText) + '</textarea>' +
     '<div style="margin-top:10px"><button class="btn" data-act="nlgo"' + (S.saving ? " disabled" : "") + ">" + (S.saving ? "Думаю…" : "Преобразовать в фильтр") + "</button></div>" +
-    (S.user.ai ? "" : '<div class="note">AI пока не подключён: добавь секрет ANTHROPIC_API_KEY в Cloudflare.</div>') + res +
+    (S.user.ai ? "" : '<div class="note">AI сейчас недоступен: ни один бесплатный провайдер не подключён или все отключены.</div>') + res +
     '<div class="hint">Перед сохранением ты увидишь результат и подтвердишь его.</div>';
 }
 
@@ -278,6 +292,91 @@ function viewSettings() {
     '<div class="card"><div class="title">Пересылка в другой чат</div><div class="sub">Числовой ID чата, куда бот сможет писать. Пусто = выкл.</div><input class="inp" id="fwd" inputmode="numeric" style="margin-top:8px" value="' + esc(u.forward_chat || "") + '"></div>' +
     '<button class="btn" data-act="savelists">Сохранить списки и пересылку</button>' +
     '<div class="card" style="margin-top:12px"><div class="title">Тема</div>' + seg(S.theme, [["auto", "Авто"], ["dark", "Тёмная"], ["light", "Светлая"]], "theme") + "</div>";
+}
+
+/* ───────── Админ-панель (права проверяются на сервере) ───────── */
+const ADM = [["dash", "📈", "Дашборд"], ["users", "👥", "Люди"], ["ai", "🧠", "AI"], ["mon", "📡", "Мониторинг"], ["res", "🛡", "Ресурсы"], ["fin", "💰", "Финансы"], ["bc", "📣", "Рассылки"], ["logs", "📜", "Логи"], ["set", "⚙️", "Настройки"]];
+const ago = (ts) => { if (ts == null) return "—"; const s = Math.max(0, Math.floor(Date.now() / 1000) - ts); return s < 90 ? s + " с назад" : s < 5400 ? Math.round(s / 60) + " мин назад" : s < 172800 ? Math.round(s / 3600) + " ч назад" : Math.round(s / 86400) + " дн назад"; };
+const kvr = (k, v) => '<div class="kv"><span>' + k + "</span><b>" + v + "</b></div>";
+const pBar = (p) => '<div class="bar"><i class="' + (p >= 0.95 ? "bad" : p >= 0.85 ? "warn2" : p >= 0.7 ? "warn" : "") + '" style="width:' + Math.min(100, Math.round((p || 0) * 100)) + '%"></i></div>';
+const tm = (ts) => new Date(ts * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+
+function viewAdmin() {
+  const a = S.adm;
+  const head = '<div class="h2row"><h2>🛡 Админ-панель</h2><button class="btn ghost sm" data-act="backmore">Назад</button></div><div class="chips big scroll">' +
+    ADM.map((x) => '<button class="chip ' + (a.sec === x[0] ? "sel" : "") + '" data-act="admsec" data-v="' + x[0] + '">' + x[1] + " " + x[2] + "</button>").join("") + "</div>";
+  if (a.err) return head + '<div class="note" style="margin-top:12px">' + esc(a.err) + "</div>";
+  if (!a.data) return head + '<div class="center" style="min-height:200px">Загружаю…</div>';
+  return head + '<div style="margin-top:12px">' + ({ dash: admDash, users: admUsers, ai: admAi, mon: admMon, res: admRes, fin: admFin, bc: admBc, logs: admLogs, set: admSet })[a.sec](a.data) + "</div>";
+}
+
+function admDash(d) {
+  const per = [["24h", "24 ч"], ["7d", "7 дн"], ["30d", "30 дн"], ["90d", "90 дн"]];
+  const st = d.status;
+  return '<div class="chips big" style="margin:0 0 12px">' + per.map((p) => '<button class="chip ' + (S.adm.period === p[0] ? "sel" : "") + '" data-act="admperiod" data-v="' + p[0] + '">' + p[1] + "</button>").join("") + "</div>" +
+    '<div class="stats"><div class="stat"><b>' + d.users + '</b><span>пользователей</span></div><div class="stat"><b>' + d.active + '</b><span>активных</span></div><div class="stat"><b>' + d.new_users + "</b><span>новых</span></div></div>" +
+    '<div class="card">' + kvr("Активных поисков", d.active_searches) + kvr("Пользователей на мониторинге", d.monitored_users) + kvr("Объявлений в базе", d.ads_total) +
+    kvr("Новых объявлений за период", d.totals.new_ads) + kvr("Уведомлений отправлено", d.totals.sent) + kvr("AI-запросов", d.totals.ai) + kvr("Ошибок", d.totals.errors) + "</div>" +
+    '<div class="card"><div class="title">Отправлено уведомлений</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.sent)) : '<div class="sub">Данных пока мало: счётчики копятся с момента обновления</div>') +
+    '<div class="title" style="margin-top:10px">Новые объявления</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.new_ads)) : "") + "</div>" +
+    '<div class="card"><div class="title">Статус системы</div>' + kvr("Cron", st.cron_ok ? "✅ работает, запуск " + ago(Math.floor(Date.now() / 1000) - (st.cron_age || 0)) : "⚠️ нет свежих запусков") + kvr("Resource Guard", st.guard ? "порог " + st.guard + "%" : "в норме") + kvr("Технические работы", st.maintenance ? "включены" : "выключены") + "</div>" +
+    '<div class="card"><div class="title">AI-запросы по провайдерам</div>' + (d.ai_by_provider.length ? d.ai_by_provider.map((p) => kvr(esc(p.provider), p.ok + " из " + p.n + " успешно")).join("") : '<div class="sub">Запросов не было</div>') + "</div>" +
+    '<div class="card"><div class="title">Доход и подписки</div><div class="sub">Платежи не подключены, выручки и MRR нет. Выдуманных цифр не показываю.</div></div><div class="hint">' + esc(d.note) + "</div>";
+}
+
+function admUsers(d) {
+  return '<div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="search" style="margin:0" id="adq" data-adm="q" placeholder="ID или @username" value="' + esc(S.adm.q) + '"><button class="btn ghost sm" data-act="admsearch">Найти</button></div><div style="height:10px"></div>' +
+    (d.items.length ? d.items.map((u) => '<div class="card" data-act="admuser" data-id="' + u.tg_id + '"><div class="title">' + esc(u.first_name || "—") + (u.username ? " @" + esc(u.username) : "") + (u.blocked ? " 🚫" : "") + '</div><div class="sub">ID ' + u.tg_id + " · был " + ago(u.last_seen) + '</div><div class="chips"><span class="chip">поисков ' + u.cats + '</span><span class="chip">прислано ' + (u.sent_total || 0) + '</span><span class="chip">AI ' + u.ai + "</span>" + (u.paused ? '<span class="chip">пауза</span>' : "") + "</div></div>").join("") : '<div class="empty">Никого не найдено</div>') +
+    (d.next != null ? '<button class="btn ghost" data-act="admmore">Ещё</button>' : "") + '<div class="hint">' + esc(d.tariff_note) + "</div>";
+}
+
+function admAi(d) {
+  const st = (x) => x.n + " / " + x.ok + " / " + x.errors + " / " + x.e429;
+  return d.providers.map((p) => '<div class="card"><div class="row"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + (p.configured ? "подключён" : "не подключён (нет ключа или привязки)") + '</div></div><div class="switch ' + (p.enabled ? "on" : "") + '" data-act="aiprov" data-id="' + p.id + '"></div></div>' +
+    '<div class="mini">' + esc(p.free) + '</div><div class="lbl">Модель</div><div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="inp" id="aim-' + p.id + '" value="' + esc(p.model) + '"><button class="btn ghost sm" data-act="aimodel" data-id="' + p.id + '">OK</button></div>' +
+    '<div style="margin-top:8px">' + kvr("24 ч: всего / ок / ошибок / 429", st(p.d1)) + kvr("7 дн: всего / ок / ошибок / 429", st(p.d7)) + kvr("Среднее время ответа", p.d7.avg_ms ? p.d7.avg_ms + " мс" : "—") + (p.cooldown_until ? kvr("Пауза до", tm(p.cooldown_until)) : "") + "</div>" +
+    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn ghost sm" data-act="aimove" data-id="' + p.id + '" data-v="up">⬆️ выше</button><button class="btn ghost sm" data-act="aimove" data-id="' + p.id + '" data-v="down">⬇️ ниже</button>' + (p.cooldown_until ? '<button class="btn ghost sm" data-act="aireset" data-id="' + p.id + '">Снять паузу</button>' : "") + "</div></div>").join("") +
+    '<div class="hint">Порядок карточек = приоритет: при ошибке или 429 запрос уходит следующему провайдеру. Каждый провайдер пробуется один раз.</div>' +
+    '<div class="card"><div class="title">AI-функции</div>' + d.features.map((f) => '<div class="row" style="margin-top:10px"><div class="grow">' + esc(f.name) + '</div><div class="switch ' + (f.enabled ? "on" : "") + '" data-act="aifeat" data-id="' + f.id + '"></div></div>').join("") + "</div>" +
+    '<div class="card">' + kvr("Сохранённых AI-анализов", d.analyses) + "</div>" +
+    '<div class="card"><div class="title">Переключения на запасного провайдера</div>' + (d.switches.length ? d.switches.map((x) => '<div class="kv"><span>' + tm(x.ts) + "</span><b>" + esc(x.provider) + "</b></div>").join("") : '<div class="sub">Не было</div>') + "</div>" +
+    '<div class="card"><div class="title">Последние ошибки</div>' + (d.errors.length ? d.errors.map((x) => '<div class="mini">' + tm(x.ts) + " · " + esc(x.provider) + " · " + x.status + " · " + esc(x.err || "") + "</div>").join("") : '<div class="sub">Ошибок нет</div>') + '</div><div class="hint">' + esc(d.keys_note) + "</div>";
+}
+
+function admMon(d) {
+  return '<div class="card">' + kvr("Активных категорий", d.active_categories) + kvr("Пользователей на мониторинге", d.monitored_users) + kvr("Объявлений в базе", d.ads_total) + kvr("Новых за 24 ч", d.ads_24h) +
+    kvr("Последний запуск Cron", d.cron ? ago(d.cron.ts) + " · " + d.cron.ms + " мс · категорий " + d.cron.cats : "нет данных") + kvr("Отстают от графика", d.lagging) + kvr("С ошибкой последней проверки", d.failing) + "</div>" +
+    '<div class="group">Категории (давно проверенные сверху)</div>' + d.categories.map((c) => '<div class="card"><div class="row"><div class="grow"><div class="title">' + esc(c.title) + '</div><div class="sub">пользователь ' + c.tg_id + " · каждые " + c.interval + " мин · проверка " + ago(c.last_check) + " · успех " + ago(c.last_ok) + '</div>' + (c.last_error ? '<div class="note">' + esc(c.last_error) + "</div>" : "") + '</div><div class="switch ' + (c.active ? "on" : "") + '" data-act="montoggle" data-id="' + c.id + '" data-v="' + (c.active ? "deactivate" : "activate") + '"></div></div><button class="btn ghost sm" style="margin-top:8px" data-act="moncheck" data-id="' + c.id + '">Проверить сейчас</button></div>').join("") +
+    '<div class="card"><div class="title">Ошибки Cron</div>' + (d.errors.length ? d.errors.map((x) => '<div class="mini">' + tm(x.ts) + " · " + esc(x.msg) + "</div>").join("") : '<div class="sub">Ошибок нет</div>') + '</div><div class="hint">' + esc(d.queue_note) + "</div>";
+}
+
+function admRes(d) {
+  return '<div class="card"><div class="title">Resource Guard: ' + (d.level ? "порог " + d.level + "%" : "всё в норме") + "</div>" + d.metrics.map((m) => m.available === false ? '<div class="kv"><span>' + esc(m.label) + '</span><b>недоступно</b></div><div class="mini">' + esc(m.note || "") + "</div>"
+      : '<div style="margin-top:10px"><div class="kv" style="border:0"><span>' + esc(m.label) + "</span><b>" + (m.limit ? Math.round(m.used).toLocaleString("ru-RU") + " из " + Math.round(m.limit).toLocaleString("ru-RU") + " (" + Math.round(m.pct * 100) + "%)" : Math.round(m.used).toLocaleString("ru-RU")) + "</b></div>" + (m.limit ? pBar(m.pct) : "") + (m.note ? '<div class="mini">' + esc(m.note) + "</div>" : "") + "</div>").join("") + "</div>" +
+    '<div class="card"><div class="title">Что делает система</div>' + Object.keys(d.actions).map((k) => kvr(k + "%", esc(d.actions[k]))).join("") + '</div><div class="hint">' + esc(d.note) + "</div>";
+}
+
+function admFin(d) { return '<div class="card"><div class="title">Финансы</div><div class="sub" style="margin-top:6px">' + esc(d.message) + "</div></div>"; }
+
+function admBc(d) {
+  const a = S.adm, auds = Object.entries(d.audiences);
+  return '<div class="card"><div class="title">Новая рассылка</div><textarea class="inp" id="admmsg" data-adm="bctext" style="margin-top:8px" placeholder="Текст сообщения">' + esc(a.bctext) + '</textarea><div class="lbl">Аудитория</div><div class="chips big">' +
+    auds.map((x) => '<button class="chip ' + (a.bcaud === x[0] ? "sel" : "") + '" data-act="bcaud" data-v="' + x[0] + '">' + esc(x[1]) + "</button>").join("") + '</div><div style="margin-top:12px"><button class="btn ghost" data-act="bcprev">Предпросмотр</button></div>' +
+    (a.bcprev ? '<div class="card" style="margin:12px 0 0;background:var(--bg);box-shadow:none"><div class="sub">Получателей: <b>' + a.bcprev.count + "</b> (" + esc(a.bcprev.audience) + ')</div><div style="margin-top:8px;white-space:pre-wrap">' + esc(a.bcprev.text) + '</div><div style="margin-top:12px"><button class="btn" data-act="bcsend">Отправить ' + a.bcprev.count + " получателям</button></div></div>" : "") + "</div>" +
+    '<div class="group">История рассылок</div>' + (d.items.length ? d.items.map((b) => '<div class="card"><div class="title">#' + b.id + " · " + tm(b.ts) + '</div><div class="sub">' + esc(b.preview) + '</div><div class="chips"><span class="chip">всего ' + b.total + '</span><span class="chip">доставлено ' + b.sent + '</span><span class="chip">ошибок ' + b.failed + '</span><span class="chip">' + (b.status === "running" ? "идёт отправка" : "готово") + "</span></div></div>").join("") : '<div class="empty">Рассылок ещё не было</div>') +
+    (d.failed.length ? '<div class="card"><div class="title">Ошибки последней рассылки</div>' + d.failed.map((f) => '<div class="mini">' + f.tg_id + " · " + esc(f.error || "") + "</div>").join("") + "</div>" : "");
+}
+
+function admLogs(d) {
+  const a = S.adm;
+  return '<div class="card"><div class="two"><select class="inp" data-adm="type"><option value="">Все типы</option>' + d.types.map((t) => '<option ' + (a.type === t ? "selected" : "") + ' value="' + esc(t) + '">' + esc(t) + "</option>").join("") + '</select><input class="inp" data-adm="user" inputmode="numeric" placeholder="ID пользователя" value="' + esc(a.user) + '"></div>' +
+    '<div class="two" style="margin-top:8px"><input class="inp" type="date" data-adm="from" value="' + esc(a.from) + '"><input class="inp" type="date" data-adm="to" value="' + esc(a.to) + '"></div><button class="btn ghost" style="margin-top:8px" data-act="logsgo">Применить</button></div>' +
+    (d.items.length ? d.items.map((e) => '<div class="card"><div class="mini">' + tm(e.ts) + " · <b>" + esc(e.type) + "</b>" + (e.tg_id ? " · " + e.tg_id : "") + '</div><div style="margin-top:2px">' + esc(e.msg) + "</div></div>").join("") : '<div class="empty">Событий нет</div>');
+}
+
+function admSet(d) {
+  return '<div class="card"><div class="row"><div class="grow"><div class="title">Технические работы</div><div class="sub">Закрывает приложение для обычных пользователей. Мониторинг продолжает работать</div></div><div class="switch ' + (d.maintenance ? "on" : "") + '" data-act="maint"></div></div></div>' +
+    '<div class="card">' + kvr("Владелец (ID)", d.owner_id) + "</div>" + d.notes.map((n) => '<div class="hint">' + esc(n) + "</div>").join("");
 }
 
 /* ───────── Шторки ───────── */
@@ -307,6 +406,13 @@ function sheetHtml() {
   } else if (sh.type === "bulk") {
     inner = '<div class="title" style="font-size:19px">Массовое изменение (' + S.sel.size + ')</div><div class="hint">Меняются только заполненные поля. Пустые поля остаются как есть.</div>' + sheetFields(sh.f, true) +
       '<div style="margin-top:22px"><button class="btn" data-act="bulksave"' + (S.saving ? " disabled" : "") + ">Применить</button></div>";
+  } else if (sh.type === "admuser") {
+    const d = sh.data;
+    inner = !d ? '<div class="center" style="min-height:200px">Загружаю…</div>' : '<div class="title" style="font-size:19px">' + esc(d.user.first_name || "—") + (d.user.username ? " @" + esc(d.user.username) : "") + "</div>" +
+      kvr("ID", d.user.tg_id) + kvr("Регистрация", d.user.created_at ? tm(d.user.created_at) : "—") + kvr("Последняя активность", ago(d.user.last_seen)) + kvr("Прислано уведомлений", d.user.sent_total || 0) + kvr("Мониторинг", d.user.paused ? "пауза" : "включён") + kvr("Статус", d.user.blocked ? "🚫 заблокирован" : "активен") +
+      '<div class="lbl">Поиски</div>' + (d.categories.length ? d.categories.map((c) => kvr(esc(c.title), c.active ? "вкл" : "выкл")).join("") : '<div class="sub">Нет</div>') +
+      '<div class="lbl">История активности</div>' + (d.events.length ? d.events.map((e) => '<div class="mini">' + tm(e.ts) + " · " + esc(e.type) + " · " + esc(e.msg) + "</div>").join("") : '<div class="sub">Событий нет</div>') +
+      '<div style="margin-top:16px"><button class="btn ' + (d.user.blocked ? "ghost" : "danger") + '" data-act="admblock" data-v="' + (d.user.blocked ? "unblock" : "block") + '">' + (d.user.blocked ? "Разблокировать" : "Заблокировать пользователя") + "</button></div>";
   } else if (sh.type === "ad") {
     inner = sh.data ? adSheet(sh) : '<div class="center" style="min-height:200px">Загружаю…</div>';
   }
@@ -345,7 +451,7 @@ function render() {
   if (S.error) { root.innerHTML = '<div class="center"><div><div style="font-size:46px">😕</div><div class="title" style="color:var(--text);margin:8px 0">Не получилось загрузить</div><div>' + esc(S.error) + '</div><br><button class="btn ghost" data-act="reload">Повторить</button></div></div>'; return; }
   const views = { home: viewHome, feed: viewFeed, mine: viewMine, favs: viewFavs, more: viewMore };
   const tabs = [["home", "🏠", "Главная"], ["feed", "🔥", "Лента"], ["mine", "📡", "Мониторинг"], ["favs", "⭐", "Избранное"], ["more", "⋯", "Ещё"]];
-  const act = document.activeElement && document.activeElement.id; const keep = ["fq", "cq", "nlt", "favnote"].includes(act);
+  const act = document.activeElement && document.activeElement.id; const keep = ["fq", "cq", "nlt", "favnote", "adq", "admmsg"].includes(act);
   const scroll = window.scrollY;
   root.innerHTML = '<div class="top"><div class="logo">kufar<span> helper</span></div><div class="pill ' + (S.user.paused ? "off" : "") + '">' + (S.user.paused ? "⏸ Пауза" : "● Мониторинг") + "</div></div>" +
     '<div class="wrap">' + views[S.tab]() + "</div>" +
@@ -389,6 +495,7 @@ document.addEventListener("input", (e) => {
   if (t.id === "fq") { S.q = t.value; clearTimeout(feedTimer); feedTimer = setTimeout(() => run(async () => { await loadFeed(); const el = $("#feedlist"); if (el) el.innerHTML = feedList(); }), 450); return; }
   if (t.id === "cq") { S.catQ = t.value; $("#tiles").innerHTML = tilesHtml(); return; }
   if (t.id === "nlt") { S.nlText = t.value; return; }
+  if (t.dataset && t.dataset.adm) { S.adm[t.dataset.adm] = t.value; return; }
   const k = t.dataset && t.dataset.f; if (k && S.sheet) S.sheet.f[k] = t.value;
 });
 
@@ -433,6 +540,33 @@ document.addEventListener("click", (e) => {
     andays: () => { S.anDays = Number(v); S.an = null; render(); run(async () => { await loadAn(); render(); }); },
     gonl: () => { S.tab = "more"; S.sub = "nl"; S.nl = null; render(); },
     gosettings: () => { S.tab = "more"; S.sub = "settings"; render(); },
+    goadmin: () => { S.tab = "more"; S.sub = "admin"; S.adm.data = null; render(); loadAdmin(); },
+    admsec: () => { S.adm.sec = v; S.adm.data = null; S.adm.offset = 0; render(); loadAdmin(); },
+    admperiod: () => { S.adm.period = v; S.adm.data = null; render(); loadAdmin(); },
+    admsearch: () => { S.adm.offset = 0; S.adm.data = null; render(); loadAdmin(); },
+    admmore: () => { S.adm.offset = S.adm.data.next; S.adm.data = null; render(); loadAdmin(); },
+    admuser: () => { S.sheet = { type: "admuser", id, data: null }; render(); api("admin/user?id=" + id).then((d) => { S.sheet.data = d; render(); }).catch((e) => { S.sheet = null; toast(e.message); render(); }); },
+    admblock: () => run(async () => { await api("admin/user", { id: Number(sh.id), action: v }); sh.data = await api("admin/user?id=" + sh.id); haptic(); toast(v === "block" ? "Заблокирован" : "Разблокирован"); render(); }),
+    aiprov: () => run(async () => { const p = S.adm.data.providers.find((x) => x.id === id); await api("admin/ai", { provider: id, enabled: !p.enabled }); await loadAdmin(); }),
+    aimodel: () => run(async () => { await api("admin/ai", { provider: id, model: $("#aim-" + id).value }); haptic(); toast("Модель сохранена"); await loadAdmin(); }),
+    aireset: () => run(async () => { await api("admin/ai", { provider: id, reset_cooldown: true }); await loadAdmin(); }),
+    aimove: () => run(async () => {
+      const ids = S.adm.data.providers.map((x) => x.id), i = ids.indexOf(id), j = v === "up" ? i - 1 : i + 1;
+      if (j < 0 || j >= ids.length) return; [ids[i], ids[j]] = [ids[j], ids[i]];
+      await api("admin/ai", { order: ids }); await loadAdmin();
+    }),
+    aifeat: () => run(async () => { const f = S.adm.data.features.find((x) => x.id === id); await api("admin/ai", { feature: id, featureEnabled: !f.enabled }); await loadAdmin(); }),
+    montoggle: () => run(async () => { await api("admin/monitoring", { id: Number(id), action: v }); await loadAdmin(); }),
+    moncheck: () => run(async () => { await api("admin/monitoring", { id: Number(id), action: "check_now" }); haptic(); toast("Проверка будет при ближайшем запуске Cron"); }),
+    bcaud: () => { S.adm.bcaud = v; S.adm.bcprev = null; render(); },
+    bcprev: () => run(async () => { S.adm.bcprev = await api("admin/broadcast", { text: S.adm.bctext, audience: S.adm.bcaud }); render(); }),
+    bcsend: () => {
+      const go = () => run(async () => { const r = await api("admin/broadcast", { text: S.adm.bctext, audience: S.adm.bcaud, confirm: true, expected: S.adm.bcprev.count }); S.adm.bcprev = null; S.adm.bctext = ""; haptic(); toast("Рассылка запущена: " + r.total + " получателей"); await loadAdmin(); });
+      const msg = "Отправить сообщение " + S.adm.bcprev.count + " получателям? Отменить будет нельзя.";
+      if (tg && tg.showConfirm) tg.showConfirm(msg, (ok) => ok && go()); else if (confirm(msg)) go();
+    },
+    logsgo: () => { S.adm.data = null; render(); loadAdmin(); },
+    maint: () => run(async () => { await api("admin/settings", { maintenance: !S.adm.data.maintenance }); haptic(); await loadAdmin(); }),
     backmore: () => { S.sub = null; render(); },
     export: () => run(async () => { const r = await api("export", {}); haptic(); toast("Файл отправлен в чат: " + r.count + " объявлений"); }),
     pause: () => {

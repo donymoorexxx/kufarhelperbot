@@ -1,4 +1,6 @@
-// Чистая логика: поиск по словам, оценка выгодности, дубликаты, CSV, запросы к Claude
+// Логика: поиск по словам, оценка выгодности, дубликаты, CSV, AI-анализ (через AI Router из core.js)
+
+import { aiJson, hashStr } from "./core.js";
 
 // ───────── Слова: нормализация, синонимы, опечатки ─────────
 const SYN = {
@@ -183,45 +185,71 @@ export function toCsv(rows, cols) {
   return "\ufeff" + [cols.map((c) => esc(c[1])).join(";"), ...rows.map((r) => cols.map((c) => esc(r[c[0]])).join(";"))].join("\r\n");
 }
 
-// ───────── Claude (нужен секрет ANTHROPIC_API_KEY) ─────────
-async function claude(env, system, user, maxTokens = 800) {
-  if (!env.ANTHROPIC_API_KEY) throw new Error("AI не подключён: добавь секрет ANTHROPIC_API_KEY в Cloudflare");
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: env.AI_MODEL || "claude-haiku-5-5", max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] }),
-  });
-  if (!r.ok) throw new Error(`AI вернул ошибку ${r.status}`);
-  const j = await r.json();
-  const text = (j.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-  const m = text.replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
-  if (!m) throw new Error("AI вернул ответ не в том формате");
-  return JSON.parse(m[0]);
+// ───────── AI-анализ объявления (бесплатные провайдеры через AI Router) ─────────
+const clampInt = (v) => Math.max(1, Math.min(100, Math.round(Number(v) || 0)));
+const strs = (a) => (Array.isArray(a) ? a.map((x) => String(x).slice(0, 220)).filter(Boolean).slice(0, 6) : []);
+
+const ANALYSIS_SYSTEM =
+  "Ты аналитик объявлений для покупателя. Используй ТОЛЬКО данные, которые даны в запросе. Правила: " +
+  "1) не придумывай характеристики; 2) не выдавай предположения за факты, неизвестное называй «не указано»; " +
+  "3) не утверждай, что товар оригинальный, исправный или без дефектов, если этого нет в данных; " +
+  "4) отсутствие информации не доказывает плохое состояние, но снижает достоверность; 5) не сравнивай несопоставимые модели; " +
+  "6) если данных мало, достоверность должна быть низкой. Учитывай специфику категории: смартфоны (модель, память, аккумулятор, комплект), " +
+  "ноутбуки (процессор, видеокарта, ОЗУ, накопитель), авто (год, пробег, двигатель), недвижимость (площадь, район, состояние). " +
+  "Фотографий ты не видишь, анализируй только текст и числа. Не показывай внутренние рассуждения, только проверяемые факты и выводы. " +
+  'Ответь только JSON: {"attractiveness_score":1-100,"confidence_score":1-100,"market_position":"ниже рынка|около рынка|выше рынка|нет данных","positive_factors":[str],"negative_factors":[str],"missing_information":[str],"price_analysis":str,"condition_analysis":str,"risk_indicators":[str],"summary":str,"recommendation":str}. ' +
+  "Всё по-русски, кратко, в списках не больше 5 пунктов. Риски формулируй как «стоит уточнить».";
+
+function normalizeAnalysis(j, nAnalogs) {
+  const out = {
+    attractiveness_score: clampInt(j.attractiveness_score), confidence_score: clampInt(j.confidence_score),
+    market_position: String(j.market_position || "нет данных").slice(0, 40),
+    positive_factors: strs(j.positive_factors), negative_factors: strs(j.negative_factors), missing_information: strs(j.missing_information),
+    price_analysis: String(j.price_analysis || "").slice(0, 500), condition_analysis: String(j.condition_analysis || "").slice(0, 500),
+    risk_indicators: strs(j.risk_indicators), summary: String(j.summary || "").slice(0, 500), recommendation: String(j.recommendation || "").slice(0, 500),
+  };
+  if (nAnalogs < 5) out.confidence_score = Math.min(out.confidence_score, 45); // мало аналогов: уверенность не выше средней
+  return out;
 }
 
-export const analyzeAd = (env, ad) =>
-  claude(
-    env,
-    "Ты помощник покупателя. Анализируй ТОЛЬКО текст объявления. Ничего не выдумывай: если сведений нет в тексте, пиши «не указано». " +
-      'Ответь только JSON без пояснений: {"condition":str,"kit":str,"description_quality":str,"specs":[str],"contradictions":[str],"missing":[str],"suspicious":[str],"summary":str,"risks":[str]}. Всё по-русски и кратко. ' +
-      "В suspicious и risks пиши только то, что следует из текста, и формулируй как «стоит уточнить», а не как факт.",
-    `Название: ${ad.title}\nЦена: ${ad.price ?? "не указана"} BYN\nГород: ${ad.city || "не указан"}\nОписание: ${ad.desc || "(пусто)"}`
-  );
+// Анализ с кэшем в D1: повторно считается, только если объявление или цена заметно изменились либо прошла неделя
+export async function analyzeAd(env, row, tgId = null) {
+  const ad = rowToAd(row);
+  const pool = (await env.DB.prepare("SELECT ad_id,title,price,sig FROM ads WHERE market=? ORDER BY first_seen DESC LIMIT 600").bind(row.market).all()).results;
+  const analogs = analogsFor(ad, pool);
+  const sc = scoreAd(ad, analogs);
+  const hist = (await env.DB.prepare("SELECT price FROM price_hist WHERE ad_id=? ORDER BY ts").bind(row.ad_id).all()).results.map((h) => h.price);
+  const hash = hashStr([ad.title, ad.price, (ad.desc || "").length, Math.floor(analogs.length / 5), hist.join(",")].join("|"));
+  const cached = await env.DB.prepare("SELECT hash, json, ts FROM ai_analysis WHERE ad_id=?").bind(row.ad_id).first();
+  const now = Math.floor(Date.now() / 1000);
+  if (cached && cached.hash === hash && now - cached.ts < 7 * 86400) { try { return { ...JSON.parse(cached.json), cached: true }; } catch {} }
 
-const list = (a) => (Array.isArray(a) && a.length ? a.map((x) => `• ${escH(x)}`).join("\n") : "—");
+  const market = sc.score != null
+    ? `Сопоставимых объявлений: ${sc.n}. Средняя цена: ${money(sc.mean)}, медиана: ${money(sc.median)}. Цена объявления отличается на ${pct(sc.devMean)} от средней и на ${pct(sc.dev)} от медианы.`
+    : `Сопоставимых объявлений недостаточно (${sc.n}), положение относительно рынка оценить нельзя.`;
+  const user =
+    `Название: ${ad.title}\nЦена: ${ad.price ?? "не указана"} BYN\nГород: ${ad.city || "не указан"}\nСостояние (поле объявления): ${ad.cond || "не указано"}\n` +
+    `Количество фото: ${ad.photos}\nКоличество указанных параметров: ${ad.params}\nОписание продавца: ${ad.desc || "(пусто)"}\n` +
+    `История цены: ${hist.length > 1 ? hist.join(" → ") + " BYN" : "не менялась"}\n${market}`;
+  const j = normalizeAnalysis(await aiJson(env, "analysis", ANALYSIS_SYSTEM, user, { maxTokens: 900, tgId }), sc.n);
+  await env.DB.prepare("INSERT INTO ai_analysis(ad_id,hash,json,ts) VALUES(?,?,?,?) ON CONFLICT(ad_id) DO UPDATE SET hash=excluded.hash, json=excluded.json, ts=excluded.ts")
+    .bind(row.ad_id, hash, JSON.stringify(j), now).run().catch(() => {});
+  return j;
+}
+
+const list = (a) => (a && a.length ? a.map((x) => `• ${escH(x)}`).join("\n") : "—");
 export const aiText = (j) =>
-  `🤖 <b>AI-АНАЛИЗ</b>\n\nСостояние: ${escH(j.condition || "не указано")}\nКомплектация: ${escH(j.kit || "не указано")}\nОписание: ${escH(j.description_quality || "—")}\n\n` +
-  `<b>Кратко:</b> ${escH(j.summary || "—")}\n\n<b>Характеристики:</b>\n${list(j.specs)}\n\n<b>Противоречия:</b>\n${list(j.contradictions)}\n\n` +
-  `<b>Не хватает сведений:</b>\n${list(j.missing)}\n\n<b>Подозрительные формулировки:</b>\n${list(j.suspicious)}\n\n<b>Возможные риски:</b>\n${list(j.risks)}\n\n<i>AI читает только текст объявления и может ошибаться.</i>`;
+  `🤖 <b>AI-АНАЛИЗ</b>${j.cached ? " (из кэша)" : ""}\n\nПривлекательность: <b>${j.attractiveness_score}/100</b> · достоверность анализа: <b>${j.confidence_score}/100</b>\nПоложение: ${escH(j.market_position)}\n\n` +
+  `<b>Кратко:</b> ${escH(j.summary || "—")}\n\n<b>Плюсы:</b>\n${list(j.positive_factors)}\n\n<b>Минусы:</b>\n${list(j.negative_factors)}\n\n` +
+  `<b>Цена:</b> ${escH(j.price_analysis || "—")}\n<b>Состояние:</b> ${escH(j.condition_analysis || "—")}\n\n<b>Не хватает сведений:</b>\n${list(j.missing_information)}\n\n` +
+  `<b>Риски (стоит уточнить):</b>\n${list(j.risk_indicators)}\n\n<b>Рекомендация:</b> ${escH(j.recommendation || "—")}\n\n<i>AI читает только текст и числа, фото не анализирует, и может ошибаться.</i>`;
 
-export const parseFilter = (env, text, categories, regions) =>
-  claude(
-    env,
-    "Преобразуй запрос покупателя в фильтр. Доступные категории (id: название): " +
-      categories.map((c) => `${c.id}: ${c.name}`).join("; ") +
+export const parseFilter = (env, text, categories, regions, tgId = null) =>
+  aiJson(
+    env, "nl",
+    "Преобразуй запрос покупателя в фильтр. Доступные категории (id: название): " + categories.map((c) => `${c.id}: ${c.name}`).join("; ") +
       ". Регионы (id: название): " + regions.map((r) => `${r.id}: ${r.name}`).join("; ") +
       '. Рубли = BYN. Ответь только JSON: {"category":id или null,"region":id или "all","min_price":число или null,"max_price":число или null,"city":строка или null,"keywords":[строки],"exclude":[строки],"condition":"new"|"used"|null,"note":строка}. ' +
       "В note кратко скажи, что не удалось определить. Не придумывай то, чего нет в запросе.",
-    text,
-    500
+    text, { maxTokens: 500, tgId }
   );

@@ -1,0 +1,479 @@
+// Ядро: метрики использования, настройки, журнал событий, защита ресурсов,
+// AI Router (только бесплатные провайдеры) и API админ-панели.
+
+export class HttpError extends Error {
+  constructor(message, status = 400) { super(message); this.status = status; }
+}
+
+// Бесплатные лимиты Cloudflare (Workers Free): D1 5 млн чтений и 100 тыс. записей в день,
+// 100 тыс. запросов Worker в день. Источник: developers.cloudflare.com/workers/platform/pricing
+export const LIMITS = { d1Reads: 5_000_000, d1Writes: 100_000, requests: 100_000, d1SizeBytes: 500 * 1024 * 1024, cronPerDay: 1440 };
+
+// ───────── Счётчики использования (считает сам бот) ─────────
+export const U = { reads: 0, writes: 0, requests: 0, cron: 0, sent: 0, newAds: 0, ai: 0, errors: 0, size: 0, lastFlush: 0, sizeSaved: 0 };
+
+function countMeta(m) {
+  if (!m) return;
+  U.reads += m.rows_read || 0;
+  U.writes += m.rows_written || 0;
+  if (m.size_after) U.size = m.size_after;
+}
+function wrapStmt(st) {
+  return {
+    __raw: st,
+    bind: (...a) => wrapStmt(st.bind(...a)),
+    all: async () => { const r = await st.all(); countMeta(r.meta); return r; },
+    first: async () => { const r = await st.all(); countMeta(r.meta); return r.results[0] ?? null; },
+    run: async () => { const r = await st.run(); countMeta(r.meta); return r; },
+  };
+}
+function wrapDB(db) {
+  return {
+    __w: true,
+    prepare: (sql) => wrapStmt(db.prepare(sql)),
+    batch: async (stmts) => {
+      const res = await db.batch(stmts.map((s) => s.__raw || s));
+      (res || []).forEach((r) => countMeta(r?.meta));
+      return res;
+    },
+  };
+}
+export const withEnv = (env) => (env.DB && !env.DB.__w ? { ...env, DB: wrapDB(env.DB) } : env);
+
+const hourKey = (ms = Date.now()) => new Date(ms).toISOString().slice(0, 13);
+const dayKey = (ms = Date.now()) => new Date(ms).toISOString().slice(0, 10);
+
+export async function flushUsage(env, force = false) {
+  const now = Date.now();
+  if (!force && now - U.lastFlush < 60000) return;
+  const snap = { reads: U.reads, writes: U.writes, requests: U.requests, cron: U.cron, sent: U.sent, newAds: U.newAds, ai: U.ai, errors: U.errors };
+  if (!Object.values(snap).some((v) => v)) return;
+  for (const k of Object.keys(snap)) U[k] = 0;
+  U.lastFlush = now;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO usage(h,reads,writes,requests,cron,sent,new_ads,ai,errors) VALUES(?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(h) DO UPDATE SET reads=reads+excluded.reads, writes=writes+excluded.writes, requests=requests+excluded.requests,
+       cron=cron+excluded.cron, sent=sent+excluded.sent, new_ads=new_ads+excluded.new_ads, ai=ai+excluded.ai, errors=errors+excluded.errors`
+    ).bind(hourKey(now), snap.reads, snap.writes, snap.requests, snap.cron, snap.sent, snap.newAds, snap.ai, snap.errors).run();
+    if (U.size && Math.abs(U.size - U.sizeSaved) > Math.max(1e6, U.sizeSaved * 0.02)) { U.sizeSaved = U.size; await setSetting(env, "d1.size", String(U.size)); }
+  } catch {
+    for (const k of Object.keys(snap)) U[k] += snap[k]; // не потеряли счётчики
+  }
+}
+
+async function usageSum(env, like) {
+  const r = await env.DB.prepare(
+    "SELECT COALESCE(SUM(reads),0) r, COALESCE(SUM(writes),0) w, COALESCE(SUM(requests),0) q, COALESCE(SUM(cron),0) c, COALESCE(SUM(ai),0) a, COALESCE(SUM(errors),0) e, COALESCE(SUM(sent),0) s, COALESCE(SUM(new_ads),0) n FROM usage WHERE h LIKE ?"
+  ).bind(like).first();
+  return r;
+}
+
+// ───────── Настройки и журнал ─────────
+const sCache = new Map();
+export async function getSetting(env, key, def = null) {
+  const c = sCache.get(key);
+  if (c && Date.now() - c.t < 20000) return c.v ?? def;
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(key).first();
+  sCache.set(key, { v: r ? r.value : null, t: Date.now() });
+  return r ? r.value : def;
+}
+export async function setSetting(env, key, value) {
+  await env.DB.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, String(value)).run();
+  sCache.set(key, { v: String(value), t: Date.now() });
+}
+
+export async function logEvent(env, type, tgId, message) {
+  if (/error|security/.test(type)) U.errors++;
+  try {
+    await env.DB.prepare("INSERT INTO events(ts,type,tg_id,msg) VALUES(?,?,?,?)").bind(Math.floor(Date.now() / 1000), type, tgId ?? null, String(message).slice(0, 400)).run();
+  } catch {}
+}
+
+// ───────── Resource Guard ─────────
+let guardCache = { t: 0, v: null };
+export async function guardInfo(env, fresh = false) {
+  if (!fresh && guardCache.v && Date.now() - guardCache.t < 30000) return guardCache.v;
+  let s;
+  try { s = await usageSum(env, dayKey() + "%"); } catch { s = { r: 0, w: 0, q: 0, c: 0, a: 0, e: 0, s: 0, n: 0 }; }
+  const reads = s.r + U.reads, writes = s.w + U.writes, requests = s.q + U.requests;
+  const pct = Math.max(writes / LIMITS.d1Writes, reads / LIMITS.d1Reads, requests / LIMITS.requests);
+  const level = pct >= 0.95 ? 95 : pct >= 0.85 ? 85 : pct >= 0.7 ? 70 : 0;
+  guardCache = { t: Date.now(), v: { level, pct, reads, writes, requests, cron: s.c + U.cron, ai: s.a + U.ai, errors: s.e + U.errors, sent: s.s + U.sent, newAds: s.n + U.newAds } };
+  return guardCache.v;
+}
+export const guardLevel = async (env) => (await guardInfo(env)).level;
+
+// ───────── Схема таблиц ядра ─────────
+export function coreSchema(env) {
+  const p = (s) => env.DB.prepare(s);
+  return [
+    p("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)"),
+    p("CREATE TABLE IF NOT EXISTS usage(h TEXT PRIMARY KEY, reads INTEGER DEFAULT 0, writes INTEGER DEFAULT 0, requests INTEGER DEFAULT 0, cron INTEGER DEFAULT 0, sent INTEGER DEFAULT 0, new_ads INTEGER DEFAULT 0, ai INTEGER DEFAULT 0, errors INTEGER DEFAULT 0)"),
+    p("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, tg_id INTEGER, msg TEXT)"),
+    p("CREATE INDEX IF NOT EXISTS events_ts ON events(ts)"),
+    p("CREATE TABLE IF NOT EXISTS ai_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, provider TEXT, model TEXT, task TEXT, ok INTEGER, status INTEGER, ms INTEGER, fallback INTEGER, tg_id INTEGER, err TEXT)"),
+    p("CREATE INDEX IF NOT EXISTS ai_log_ts ON ai_log(ts)"),
+    p("CREATE TABLE IF NOT EXISTS ai_analysis(ad_id TEXT PRIMARY KEY, hash TEXT, json TEXT, ts INTEGER)"),
+    p("CREATE TABLE IF NOT EXISTS broadcasts(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, text TEXT, audience TEXT, total INTEGER, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT)"),
+    p("CREATE TABLE IF NOT EXISTS broadcast_targets(bid INTEGER, tg_id INTEGER, status TEXT DEFAULT 'pending', error TEXT, PRIMARY KEY(bid, tg_id))"),
+  ];
+}
+export const coreAlters = [
+  "ALTER TABLE users ADD COLUMN created_at INTEGER", "ALTER TABLE users ADD COLUMN last_seen INTEGER", "ALTER TABLE users ADD COLUMN username TEXT",
+  "ALTER TABLE users ADD COLUMN first_name TEXT", "ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0", "ALTER TABLE users ADD COLUMN sent_total INTEGER DEFAULT 0",
+  "ALTER TABLE categories ADD COLUMN last_ok INTEGER", "ALTER TABLE categories ADD COLUMN last_error TEXT",
+];
+
+// ───────── AI Router: только бесплатные провайдеры ─────────
+// Ключи провайдеров хранятся только в Cloudflare Secrets. Workers AI работает через привязку AI без ключа.
+const PROVIDERS = {
+  workers_ai: { name: "Cloudflare Workers AI", free: "10 000 нейронов в день на бесплатном плане (часть моделей требует платный план)", def: "@cf/google/gemma-4-26b-a4b-it", env: "WORKERS_AI_MODEL", ok: (e) => !!e.AI },
+  groq: { name: "Groq", free: "бесплатный план, лимиты по моделям (запросы и токены)", def: "llama-3.3-70b-versatile", env: "GROQ_MODEL", ok: (e) => !!e.GROQ_API_KEY },
+  gemini: { name: "Google Gemini (AI Studio)", free: "бесплатный уровень только для части моделей, возможны ограничения по региону", def: "gemini-3.5-flash", env: "GEMINI_MODEL", ok: (e) => !!e.GEMINI_API_KEY },
+  openrouter: { name: "OpenRouter", free: "только модели с суффиксом :free, доступность меняется", def: "meta-llama/llama-3.3-70b-instruct:free", env: "OPENROUTER_MODEL", ok: (e) => !!e.OPENROUTER_API_KEY },
+};
+const DEFAULT_ORDER = ["workers_ai", "groq", "gemini", "openrouter"];
+export const AI_FEATURES = { analysis: "Анализ объявления", nl: "Фильтр обычными словами" };
+
+class AiError extends Error {
+  constructor(message, status = 0) { super(message); this.status = status; }
+}
+
+async function providerOrder(env) {
+  let order = DEFAULT_ORDER;
+  try { const s = JSON.parse(await getSetting(env, "ai.order", "null")); if (Array.isArray(s)) order = s.filter((x) => PROVIDERS[x]).concat(DEFAULT_ORDER.filter((x) => !s.includes(x))); } catch {}
+  return order;
+}
+const modelFor = async (env, p) => (await getSetting(env, `ai.model.${p}`)) || env[PROVIDERS[p].env] || PROVIDERS[p].def;
+
+export async function aiAvailable(env) {
+  for (const p of Object.keys(PROVIDERS)) {
+    if (PROVIDERS[p].ok(env) && (await getSetting(env, `ai.enabled.${p}`, "1")) !== "0") return true;
+  }
+  return false;
+}
+
+function statusOf(e) {
+  if (e instanceof AiError && e.status) return e.status;
+  const m = String(e?.message || "");
+  if (/429|3040|capacity|rate.?limit|too many|quota|neurons|exhaust/i.test(m)) return 429;
+  if (/403|5035|forbidden|paid/i.test(m)) return 403;
+  return 0;
+}
+
+async function callProvider(env, p, model, system, user, maxTokens) {
+  if (p === "workers_ai") {
+    const r = await env.AI.run(model, { messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0.2 });
+    let t = typeof r === "string" ? r : r?.response ?? r?.choices?.[0]?.message?.content ?? r?.result?.response;
+    if (t && typeof t === "object") t = JSON.stringify(t);
+    if (!t) throw new AiError("пустой ответ Workers AI");
+    return String(t);
+  }
+  if (p === "gemini") {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: user }] }], generationConfig: { maxOutputTokens: maxTokens, temperature: 0.2, responseMimeType: "application/json" } }),
+    });
+    if (!r.ok) throw new AiError(`Gemini HTTP ${r.status}`, r.status);
+    const j = await r.json();
+    return (j.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("");
+  }
+  const url = p === "groq" ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
+  const key = p === "groq" ? env.GROQ_API_KEY : env.OPENROUTER_API_KEY;
+  const r = await fetch(url, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}`, "X-Title": "Kufar Helper" },
+    body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0.2 }),
+  });
+  if (!r.ok) throw new AiError(`${PROVIDERS[p].name} HTTP ${r.status}`, r.status);
+  const j = await r.json();
+  return j.choices?.[0]?.message?.content || "";
+}
+
+function parseJson(text) {
+  const m = String(text).replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
+  if (!m) throw new AiError("ответ не в формате JSON");
+  try { return JSON.parse(m[0]); } catch { throw new AiError("ответ не удалось разобрать как JSON"); }
+}
+
+export function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36);
+}
+
+// Единая точка вызова нейросети: проверка отключения, кэш, ресурсы, перебор провайдеров (по одному разу каждый)
+export async function aiJson(env, task, system, user, opts = {}) {
+  const { maxTokens = 800, cacheKey = null, tgId = null } = opts;
+  if ((await getSetting(env, `ai.feature.${task}`, "1")) === "0") throw new AiError("Эта AI-функция отключена администратором", 403);
+  if (cacheKey) {
+    const c = await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(`aic.${cacheKey}`).first();
+    if (c) { try { return JSON.parse(c.value); } catch {} }
+  }
+  if ((await guardLevel(env)) >= 85) throw new AiError("AI отложен: близок лимит ресурсов Cloudflare. Мониторинг продолжает работать, попробуй позже.", 503);
+
+  const now = Math.floor(Date.now() / 1000);
+  const usable = [];
+  for (const p of await providerOrder(env)) {
+    if (!PROVIDERS[p].ok(env)) continue;
+    if ((await getSetting(env, `ai.enabled.${p}`, "1")) === "0") continue;
+    if (Number(await getSetting(env, `ai.cool.${p}`, "0")) > now) continue;
+    usable.push(p);
+  }
+  if (!usable.length) throw new AiError("Нет доступных бесплатных AI-провайдеров (не подключены, отключены или исчерпали лимит)", 503);
+
+  let last = null;
+  for (let i = 0; i < usable.length; i++) {
+    const p = usable[i], model = await modelFor(env, p), t0 = Date.now();
+    const log = (ok, status, err) => env.DB.prepare("INSERT INTO ai_log(ts,provider,model,task,ok,status,ms,fallback,tg_id,err) VALUES(?,?,?,?,?,?,?,?,?,?)")
+      .bind(now, p, model, task, ok ? 1 : 0, status, Date.now() - t0, i > 0 ? 1 : 0, tgId, err ? String(err).slice(0, 200) : null).run().catch(() => {});
+    U.ai++;
+    try {
+      const data = parseJson(await callProvider(env, p, model, system, user, maxTokens));
+      await log(true, 200, null);
+      if (cacheKey) await setSetting(env, `aic.${cacheKey}`, JSON.stringify(data)).catch(() => {});
+      return data;
+    } catch (e) {
+      last = e;
+      const st = statusOf(e);
+      await log(false, st, e.message);
+      if (st === 429) {
+        const daily = /neurons|daily|3036|4006/i.test(e.message);
+        const until = daily ? Math.floor(Date.now() / 86400000 + 1) * 86400 : now + 60;
+        await setSetting(env, `ai.cool.${p}`, until).catch(() => {});
+      }
+      await logEvent(env, "ai_error", tgId, `${p}: ${e.message}`);
+    }
+  }
+  throw new AiError("Все бесплатные AI-провайдеры сейчас недоступны или исчерпали лимиты. Мониторинг работает как обычно.", 503);
+}
+
+// ───────── Рассылки: отправка порциями по Cron ─────────
+export async function processBroadcasts(env, sendFn) {
+  const b = await env.DB.prepare("SELECT * FROM broadcasts WHERE status='running' ORDER BY id LIMIT 1").first();
+  if (!b) return;
+  const targets = (await env.DB.prepare("SELECT tg_id FROM broadcast_targets WHERE bid=? AND status='pending' LIMIT 20").bind(b.id).all()).results;
+  const stmts = [];
+  for (const t of targets) {
+    const r = await sendFn(t.tg_id, b.text);
+    if (r.ok) stmts.push(env.DB.prepare("UPDATE broadcast_targets SET status='sent' WHERE bid=? AND tg_id=?").bind(b.id, t.tg_id));
+    else {
+      stmts.push(env.DB.prepare("UPDATE broadcast_targets SET status='failed', error=? WHERE bid=? AND tg_id=?").bind(String(r.description || r.error_code || "ошибка").slice(0, 120), b.id, t.tg_id));
+      if (r.error_code === 403) stmts.push(env.DB.prepare("UPDATE users SET paused=1 WHERE tg_id=?").bind(t.tg_id));
+    }
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  const c = await env.DB.prepare("SELECT SUM(status='sent') s, SUM(status='failed') f, SUM(status='pending') p FROM broadcast_targets WHERE bid=?").bind(b.id).first();
+  await env.DB.prepare("UPDATE broadcasts SET sent=?, failed=?, status=? WHERE id=?").bind(c.s || 0, c.f || 0, (c.p || 0) > 0 ? "running" : "done", b.id).run();
+}
+
+// ───────── API админ-панели (только владелец, проверка в api.js) ─────────
+const num0 = (v) => Number(v) || 0;
+
+export async function handleAdmin(env, ownerId, path, method, q, body) {
+  const now = Math.floor(Date.now() / 1000);
+  const sub = path.replace("/api/admin/", "");
+  const audit = (msg) => logEvent(env, "admin", ownerId, msg);
+
+  if (sub === "dashboard") {
+    const period = ["24h", "7d", "30d", "90d"].includes(q.get("period")) ? q.get("period") : "7d";
+    const secs = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400 }[period];
+    const since = now - secs, hourly = period === "24h";
+    const [users, active, regs, cats, monitored, adsTotal, aiBy, usageRows, newUsers] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) c FROM users").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM users WHERE last_seen>=?").bind(since).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM users WHERE created_at>=?").bind(since).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM categories WHERE active=1").first(),
+      env.DB.prepare("SELECT COUNT(DISTINCT c.tg_id) c FROM categories c JOIN users u ON u.tg_id=c.tg_id WHERE c.active=1 AND u.paused=0 AND u.blocked=0").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ads").first(),
+      env.DB.prepare("SELECT provider, COUNT(*) n, SUM(ok) ok FROM ai_log WHERE ts>=? GROUP BY provider").bind(since).all(),
+      env.DB.prepare(`SELECT ${hourly ? "h" : "substr(h,1,10)"} t, SUM(new_ads) new_ads, SUM(sent) sent, SUM(ai) ai, SUM(errors) errors, SUM(requests) requests FROM usage WHERE h>=? GROUP BY t ORDER BY t`)
+        .bind(hourly ? hourKey((since) * 1000) : dayKey(since * 1000)).all(),
+      env.DB.prepare("SELECT created_at FROM users WHERE created_at>=?").bind(since).all(),
+    ]);
+    const byKey = new Map(newUsers.results.map((r) => [hourly ? hourKey(r.created_at * 1000) : dayKey(r.created_at * 1000), 0]));
+    for (const r of newUsers.results) { const k = hourly ? hourKey(r.created_at * 1000) : dayKey(r.created_at * 1000); byKey.set(k, (byKey.get(k) || 0) + 1); }
+    const series = usageRows.results.map((r) => ({ t: r.t, new_ads: num0(r.new_ads), sent: num0(r.sent), ai: num0(r.ai), errors: num0(r.errors), requests: num0(r.requests), new_users: byKey.get(r.t) || 0 }));
+    const tot = series.reduce((a, s) => ({ new_ads: a.new_ads + s.new_ads, sent: a.sent + s.sent, ai: a.ai + s.ai, errors: a.errors + s.errors }), { new_ads: 0, sent: 0, ai: 0, errors: 0 });
+    const cron = JSON.parse((await getSetting(env, "cron.last", "null")) || "null");
+    const g = await guardInfo(env);
+    return {
+      period, users: users.c, active: active.c, new_users: regs.c, active_searches: cats.c, monitored_users: monitored.c, ads_total: adsTotal.c, totals: tot,
+      ai_by_provider: aiBy.results, series, finance: { connected: false },
+      status: { cron_age: cron ? now - cron.ts : null, cron_ok: !!cron && now - cron.ts < 300, guard: g.level, maintenance: (await getSetting(env, "maintenance", "0")) === "1" },
+      note: "«Прислано» и «новые объявления» считаются по реально отправленным уведомлениям и сохранённым объявлениям с момента включения учёта.",
+    };
+  }
+
+  if (sub === "users") {
+    const text = (q.get("q") || "").trim();
+    const offset = Math.max(0, Number(q.get("offset")) || 0);
+    const where = text ? "WHERE CAST(u.tg_id AS TEXT) LIKE ? OR u.username LIKE ?" : "";
+    const args = text ? [`%${text}%`, `%${text.replace(/^@/, "")}%`] : [];
+    const rows = (await env.DB.prepare(
+      `SELECT u.tg_id, u.username, u.first_name, u.created_at, u.last_seen, u.paused, u.blocked, u.sent_total,
+        (SELECT COUNT(*) FROM categories c WHERE c.tg_id=u.tg_id) cats, (SELECT COUNT(*) FROM ai_log a WHERE a.tg_id=u.tg_id) ai
+       FROM users u ${where} ORDER BY COALESCE(u.last_seen,0) DESC LIMIT 30 OFFSET ?`).bind(...args, offset).all()).results;
+    return { items: rows, offset, next: rows.length === 30 ? offset + 30 : null, tariff_note: "Тарифы и лимиты появятся на этапе тарифной системы." };
+  }
+
+  if (sub === "user") {
+    const id = Number(q.get("id") || body.id);
+    if (!Number.isSafeInteger(id)) throw new HttpError("Нужен ID пользователя");
+    if (method === "POST") {
+      if (id === Number(ownerId)) throw new HttpError("Нельзя менять владельца");
+      if (body.action === "block" || body.action === "unblock") {
+        const r = await env.DB.prepare("UPDATE users SET blocked=? WHERE tg_id=?").bind(body.action === "block" ? 1 : 0, id).run();
+        if (!r.meta.changes) throw new HttpError("Пользователь не найден", 404);
+        await audit(`${body.action === "block" ? "заблокирован" : "разблокирован"} пользователь ${id}`);
+        return { ok: true };
+      }
+      throw new HttpError("Неизвестное действие");
+    }
+    const [u, cats, ev] = await Promise.all([
+      env.DB.prepare("SELECT tg_id,username,first_name,created_at,last_seen,paused,blocked,sent_total,quiet,report FROM users WHERE tg_id=?").bind(id).first(),
+      env.DB.prepare("SELECT title, active, last_check, last_ok, last_error FROM categories WHERE tg_id=?").bind(id).all(),
+      env.DB.prepare("SELECT ts,type,msg FROM events WHERE tg_id=? ORDER BY id DESC LIMIT 30").bind(id).all(),
+    ]);
+    if (!u) throw new HttpError("Пользователь не найден", 404);
+    return { user: u, categories: cats.results, events: ev.results };
+  }
+
+  if (sub === "ai") {
+    if (method === "POST") {
+      if (body.provider) {
+        if (!PROVIDERS[body.provider]) throw new HttpError("Неизвестный провайдер");
+        if ("enabled" in body) { await setSetting(env, `ai.enabled.${body.provider}`, body.enabled ? "1" : "0"); await audit(`AI: провайдер ${body.provider} ${body.enabled ? "включён" : "отключён"}`); }
+        if (typeof body.model === "string") { await setSetting(env, `ai.model.${body.provider}`, body.model.trim().slice(0, 120)); await audit(`AI: модель ${body.provider} = ${body.model}`); }
+        if (body.reset_cooldown) await setSetting(env, `ai.cool.${body.provider}`, "0");
+      }
+      if (Array.isArray(body.order)) { await setSetting(env, "ai.order", JSON.stringify(body.order.filter((x) => PROVIDERS[x]))); await audit("AI: изменён приоритет провайдеров"); }
+      if (body.feature) {
+        if (!AI_FEATURES[body.feature]) throw new HttpError("Неизвестная AI-функция");
+        await setSetting(env, `ai.feature.${body.feature}`, body.featureEnabled ? "1" : "0"); await audit(`AI: функция ${body.feature} ${body.featureEnabled ? "включена" : "отключена"}`);
+      }
+      return { ok: true };
+    }
+    const since24 = now - 86400, since7 = now - 7 * 86400;
+    const order = await providerOrder(env);
+    const stat = async (p, since) => env.DB.prepare("SELECT COUNT(*) n, COALESCE(SUM(ok),0) ok, COALESCE(SUM(status=429),0) e429, AVG(CASE WHEN ok=1 THEN ms END) avg FROM ai_log WHERE provider=? AND ts>=?").bind(p, since).first();
+    const providers = [];
+    for (const p of order) {
+      const [s24, s7] = await Promise.all([stat(p, since24), stat(p, since7)]);
+      providers.push({
+        id: p, name: PROVIDERS[p].name, free: PROVIDERS[p].free, configured: PROVIDERS[p].ok(env), enabled: (await getSetting(env, `ai.enabled.${p}`, "1")) !== "0",
+        model: await modelFor(env, p), cooldown_until: Number(await getSetting(env, `ai.cool.${p}`, "0")) > now ? Number(await getSetting(env, `ai.cool.${p}`, "0")) : null,
+        d1: { n: s24.n, ok: s24.ok, errors: s24.n - s24.ok, e429: s24.e429, avg_ms: s24.avg ? Math.round(s24.avg) : null }, d7: { n: s7.n, ok: s7.ok, errors: s7.n - s7.ok, e429: s7.e429, avg_ms: s7.avg ? Math.round(s7.avg) : null },
+      });
+    }
+    const [errs, sw, cached, analyses] = await Promise.all([
+      env.DB.prepare("SELECT ts,provider,status,err FROM ai_log WHERE ok=0 ORDER BY id DESC LIMIT 15").all(),
+      env.DB.prepare("SELECT ts,provider,task FROM ai_log WHERE fallback=1 AND ok=1 ORDER BY id DESC LIMIT 15").all(),
+      env.DB.prepare("SELECT COUNT(*) c FROM settings WHERE key LIKE 'aic.%'").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ai_analysis").first(),
+    ]);
+    const features = [];
+    for (const f of Object.keys(AI_FEATURES)) features.push({ id: f, name: AI_FEATURES[f], enabled: (await getSetting(env, `ai.feature.${f}`, "1")) !== "0" });
+    return { providers, errors: errs.results, switches: sw.results, cached: cached.c, analyses: analyses.c, features, keys_note: "Ключи провайдеров хранятся в Cloudflare Secrets и здесь не показываются." };
+  }
+
+  if (sub === "monitoring") {
+    if (method === "POST") {
+      const id = Number(body.id);
+      if (body.action === "check_now") await env.DB.prepare("UPDATE categories SET last_check=0 WHERE id=?").bind(id).run();
+      else if (body.action === "activate" || body.action === "deactivate") await env.DB.prepare("UPDATE categories SET active=? WHERE id=?").bind(body.action === "activate" ? 1 : 0, id).run();
+      else throw new HttpError("Неизвестное действие");
+      await audit(`мониторинг: ${body.action} категория ${id}`);
+      return { ok: true };
+    }
+    const [cats, monitored, adsToday, adsAll, lag, failing, list, errs] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) c FROM categories WHERE active=1").first(),
+      env.DB.prepare("SELECT COUNT(DISTINCT c.tg_id) c FROM categories c JOIN users u ON u.tg_id=c.tg_id WHERE c.active=1 AND u.paused=0 AND u.blocked=0").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ads WHERE first_seen>=?").bind(now - 86400).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ads").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM categories c JOIN users u ON u.tg_id=c.tg_id WHERE c.active=1 AND u.paused=0 AND u.blocked=0 AND c.last_check + c.interval*180 < ?").bind(now).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM categories WHERE active=1 AND last_error IS NOT NULL").first(),
+      env.DB.prepare("SELECT c.id, c.tg_id, c.title, c.interval, c.active, c.last_check, c.last_ok, c.last_error FROM categories c ORDER BY c.last_check ASC LIMIT 30").all(),
+      env.DB.prepare("SELECT ts,msg FROM events WHERE type='cron_error' ORDER BY id DESC LIMIT 10").all(),
+    ]);
+    const cron = JSON.parse((await getSetting(env, "cron.last", "null")) || "null");
+    return {
+      active_categories: cats.c, monitored_users: monitored.c, ads_total: adsAll.c, ads_24h: adsToday.c, lagging: lag.c, failing: failing.c,
+      cron, cron_age: cron ? now - cron.ts : null, categories: list.results, errors: errs.results,
+      queue_note: "Отдельной очереди нет: Cron берёт самые давно проверенные категории. «Отстают» — категории, не проверявшиеся втрое дольше своего интервала.",
+    };
+  }
+
+  if (sub === "resources") {
+    const g = await guardInfo(env, true);
+    const size = Number(await getSetting(env, "d1.size", "0")) || U.size || null;
+    const mk = (key, label, used, limit, note) => ({ key, label, used, limit, pct: limit ? used / limit : null, available: true, note });
+    return {
+      level: g.level, thresholds: [70, 85, 95],
+      metrics: [
+        mk("d1r", "D1: чтение строк за сутки", g.reads, LIMITS.d1Reads), mk("d1w", "D1: запись строк за сутки", g.writes, LIMITS.d1Writes),
+        mk("req", "Запросы Worker за сутки", g.requests, LIMITS.requests), mk("cron", "Запуски Cron за сутки", g.cron, LIMITS.cronPerDay),
+        size ? mk("size", "Размер базы D1", size, LIMITS.d1SizeBytes, "лимит 500 МБ на базу на бесплатном плане по документации D1") : { key: "size", label: "Размер базы D1", available: false, note: "Появится после первой записи метрик" },
+        { key: "ai", label: "AI-запросы за сутки (учтены ботом)", used: g.ai, limit: null, available: true, note: "Расход нейронов Workers AI Cloudflare в API не отдаёт, смотри в панели Workers AI" },
+        { key: "errors", label: "Ошибки Worker за сутки (учтены ботом)", used: g.errors, limit: null, available: true },
+        { key: "queues", label: "Очереди Cloudflare", available: false, note: "Не подключены" }, { key: "kv", label: "Cloudflare KV", available: false, note: "Не подключён" },
+      ],
+      actions: { 70: "пропускаются отчёты", 85: "AI и рассылки приостановлены, проверка избранного отложена, за запуск Cron берутся 2 категории", 95: "за запуск Cron берётся 1 категория, мониторинг остаётся главным приоритетом" },
+      note: "Показатели считает сам бот по ответам D1 и могут отличаться от панели Cloudflare. Официальные метрики через GraphQL API требуют отдельный API-токен, он не подключён.",
+    };
+  }
+
+  if (sub === "finance") {
+    return { connected: false, message: "Платёжная система не подключена. Выручки, подписок и платежей нет, и я не показываю выдуманных цифр. Тарифы и оплату подключим отдельным этапом после твоего разрешения." };
+  }
+
+  if (sub === "settings") {
+    if (method === "POST") {
+      if ("maintenance" in body) { await setSetting(env, "maintenance", body.maintenance ? "1" : "0"); await audit(`технические работы ${body.maintenance ? "включены" : "выключены"}`); }
+      return { ok: true };
+    }
+    return { maintenance: (await getSetting(env, "maintenance", "0")) === "1", owner_id: ownerId, notes: ["Режим техработ закрывает Mini App для обычных пользователей. Мониторинг и уведомления продолжают работать.", "Тарифы, лимиты, промокоды и рефералы будут на этапе тарифной системы."] };
+  }
+
+  if (sub === "broadcast") {
+    const audiences = {
+      all: ["Все пользователи", "SELECT tg_id FROM users WHERE blocked=0"],
+      active7: ["Активные за 7 дней", `SELECT tg_id FROM users WHERE blocked=0 AND last_seen>=${now - 7 * 86400}`],
+      monitoring: ["С включённым мониторингом", "SELECT DISTINCT u.tg_id FROM users u JOIN categories c ON c.tg_id=u.tg_id WHERE u.blocked=0 AND u.paused=0 AND c.active=1"],
+    };
+    if (method === "POST") {
+      const text = String(body.text || "").trim();
+      if (!text) throw new HttpError("Напиши текст сообщения");
+      if (text.length > 3500) throw new HttpError("Слишком длинное сообщение");
+      const a = audiences[body.audience];
+      if (!a) throw new HttpError("Выбери аудиторию");
+      const targets = (await env.DB.prepare(a[1]).all()).results;
+      if (!body.confirm) return { preview: true, count: targets.length, audience: a[0], text };
+      if (Number(body.expected) !== targets.length) throw new HttpError("Аудитория изменилась, посмотри предпросмотр ещё раз");
+      if (!targets.length) throw new HttpError("В выбранной аудитории никого нет");
+      const r = await env.DB.prepare("INSERT INTO broadcasts(ts,text,audience,total,status) VALUES(?,?,?,?,'running')").bind(now, text, body.audience, targets.length).run();
+      const bid = r.meta.last_row_id;
+      for (let i = 0; i < targets.length; i += 40) {
+        await env.DB.batch(targets.slice(i, i + 40).map((t) => env.DB.prepare("INSERT OR IGNORE INTO broadcast_targets(bid,tg_id) VALUES(?,?)").bind(bid, t.tg_id)));
+      }
+      await audit(`рассылка #${bid}: ${targets.length} получателей (${a[0]})`);
+      return { ok: true, id: bid, total: targets.length };
+    }
+    const list = (await env.DB.prepare("SELECT id, ts, substr(text,1,100) preview, audience, total, sent, failed, status FROM broadcasts ORDER BY id DESC LIMIT 10").all()).results;
+    const failed = list.length ? (await env.DB.prepare("SELECT tg_id, error FROM broadcast_targets WHERE bid=? AND status='failed' LIMIT 10").bind(list[0].id).all()).results : [];
+    return { items: list, failed, audiences: Object.fromEntries(Object.entries(audiences).map(([k, v]) => [k, v[0]])) };
+  }
+
+  if (sub === "logs") {
+    const where = [], args = [];
+    if (q.get("type")) { where.push("type=?"); args.push(q.get("type")); }
+    if (q.get("user")) { where.push("tg_id=?"); args.push(Number(q.get("user"))); }
+    if (q.get("from")) { where.push("ts>=?"); args.push(Math.floor(Date.parse(q.get("from") + "T00:00:00Z") / 1000) || 0); }
+    if (q.get("to")) { where.push("ts<?"); args.push(Math.floor(Date.parse(q.get("to") + "T00:00:00Z") / 1000) + 86400 || now + 86400); }
+    const rows = (await env.DB.prepare(`SELECT ts,type,tg_id,msg FROM events ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY id DESC LIMIT 100`).bind(...args).all()).results;
+    const types = (await env.DB.prepare("SELECT DISTINCT type FROM events").all()).results.map((r) => r.type);
+    return { items: rows, types };
+  }
+
+  throw new HttpError("Not found", 404);
+}

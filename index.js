@@ -7,6 +7,8 @@ import {
   analyzeAd, aiText, rowToAd, money, median,
 } from "./logic.js";
 
+import { withEnv, U, flushUsage, getSetting, setSetting, logEvent, guardInfo, coreSchema, coreAlters, processBroadcasts } from "./core.js";
+
 let APP_URL = ""; // адрес воркера для кнопок открытия Mini App
 
 const MAX_CATS_PER_RUN = 3; // категорий за один запуск cron
@@ -37,6 +39,7 @@ async function ensureSchema(env) {
     p(`CREATE TABLE IF NOT EXISTS price_hist(ad_id TEXT, price REAL, ts INTEGER)`),
     p(`CREATE INDEX IF NOT EXISTS ph_ad ON price_hist(ad_id)`),
     p(`CREATE TABLE IF NOT EXISTS favs(tg_id INTEGER, ad_id TEXT, note TEXT, added INTEGER, price0 REAL, checked INTEGER DEFAULT 0, gone INTEGER DEFAULT 0, PRIMARY KEY(tg_id, ad_id))`),
+    ...coreSchema(env),
   ]);
   const alters = [
     "ALTER TABLE categories ADD COLUMN cat_key TEXT", "ALTER TABLE categories ADD COLUMN since INTEGER",
@@ -44,7 +47,7 @@ async function ensureSchema(env) {
     "ALTER TABLE users ADD COLUMN quiet INTEGER DEFAULT 0", "ALTER TABLE users ADD COLUMN bl_words TEXT", "ALTER TABLE users ADD COLUMN bl_sellers TEXT",
     "ALTER TABLE users ADD COLUMN report TEXT DEFAULT 'off'", "ALTER TABLE users ADD COLUMN report_last TEXT", "ALTER TABLE users ADD COLUMN forward_chat INTEGER",
   ];
-  for (const a of alters) {
+  for (const a of [...alters, ...coreAlters]) {
     try { await env.DB.prepare(a).run(); } catch {} // колонка уже есть
   }
   schemaReady = true;
@@ -55,9 +58,15 @@ const all = async (env, sql, ...a) => (await prep(env, sql, ...a).all()).results
 const one = (env, sql, ...a) => prep(env, sql, ...a).first();
 const run = (env, sql, ...a) => prep(env, sql, ...a).run();
 
-async function ensureUser(env, id) {
-  await run(env, "INSERT OR IGNORE INTO users(tg_id, interval) VALUES(?, ?)", id, DEFAULT_INTERVAL);
-  return one(env, "SELECT * FROM users WHERE tg_id=?", id);
+async function ensureUser(env, id, info) {
+  const now = Math.floor(Date.now() / 1000);
+  await run(env, "INSERT OR IGNORE INTO users(tg_id, interval, created_at) VALUES(?, ?, ?)", id, DEFAULT_INTERVAL, now);
+  const u = await one(env, "SELECT * FROM users WHERE tg_id=?", id);
+  if (!u.last_seen || now - u.last_seen > 300 || (info && (info.username ?? null) !== (u.username ?? null))) {
+    await run(env, "UPDATE users SET last_seen=?, username=COALESCE(?, username), first_name=COALESCE(?, first_name), created_at=COALESCE(created_at, ?) WHERE tg_id=?",
+      now, info?.username ?? null, info?.first_name ?? null, now, id);
+  }
+  return u; // строка до обновления: по last_seen видно, давно ли пользователь заходил
 }
 async function batchChunks(env, stmts) {
   for (let i = 0; i < stmts.length; i += 40) await env.DB.batch(stmts.slice(i, i + 40));
@@ -195,7 +204,7 @@ function adCard(ad, sc, extra) {
 function adButtons(env, ad) {
   const rows = [[{ text: "Открыть на Kufar", url: ad.url }]];
   const r2 = [B("⭐ В избранное", `fav:${ad.id}`)];
-  if (env.ANTHROPIC_API_KEY) r2.push(B("🤖 AI-анализ", `ai:${ad.id}`));
+  if (env.AI || env.GROQ_API_KEY || env.GEMINI_API_KEY || env.OPENROUTER_API_KEY) r2.push(B("🤖 AI-анализ", `ai:${ad.id}`));
   rows.push(r2);
   if (ad.seller) rows.push([B("🚫 Скрыть продавца", `bls:${ad.id}`)]);
   return kb(rows);
@@ -216,7 +225,11 @@ async function sendAd(env, chat, ad, text, markup, silent) {
 async function onMessage(env, msg) {
   if (msg.chat.type !== "private") return;
   const id = msg.from.id;
-  await ensureUser(env, id);
+  const u = await ensureUser(env, id, msg.from);
+  if (u.blocked) return;
+  if ((await getSetting(env, "maintenance", "0")) === "1" && String(id) !== String(env.OWNER_TELEGRAM_ID)) {
+    return send(env, id, "🛠 Идут технические работы. Мониторинг продолжает работать, приложение скоро вернётся.");
+  }
   const text = (msg.text || "").trim();
   if (text.startsWith("/start") || text.startsWith("/menu")) {
     return send(env, id, "Привет! Я слежу за новыми объявлениями на Kufar, оцениваю цены и присылаю находки сюда.\nВсе настройки в приложении 👇", mainMenu());
@@ -233,7 +246,8 @@ async function catList(env, id) {
 async function onCallback(env, cb) {
   const id = cb.from.id;
   const [a, b] = (cb.data || "").split(":");
-  const user = await ensureUser(env, id);
+  const user = await ensureUser(env, id, cb.from);
+  if (user.blocked) return tg(env, "answerCallbackQuery", { callback_query_id: cb.id });
   const key = a === "menu" ? `menu:${b}` : a;
   const toast = (t, alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text: t, show_alert: alert });
 
@@ -313,7 +327,7 @@ async function onCallback(env, cb) {
       if (!row) return toast("Объявление не найдено", true);
       await toast("🤖 Анализирую…");
       try {
-        await send(env, id, aiText(await analyzeAd(env, rowToAd(row))));
+        await send(env, id, aiText(await analyzeAd(env, row, id)));
       } catch (e) {
         await send(env, id, `Не получилось: ${esc(e.message)}`);
       }
@@ -334,7 +348,15 @@ async function checkCategory(env, cat) {
   if (claim.meta.changes === 0) return;
 
   let ads;
-  try { ads = await fetchAds(cat.url); } catch (e) { console.log("fetch failed", cat.id, e.message); return; }
+  try { ads = await fetchAds(cat.url); } catch (e) {
+    console.log("fetch failed", cat.id, e.message);
+    if (cat.last_error !== e.message.slice(0, 120)) {
+      await run(env, "UPDATE categories SET last_error=? WHERE id=?", e.message.slice(0, 120), cat.id);
+      await logEvent(env, "cron_error", cat.tg_id, `категория ${cat.id}: ${e.message}`);
+    }
+    return;
+  }
+  await run(env, "UPDATE categories SET last_ok=?, last_error=NULL WHERE id=?", now, cat.id);
   if (!ads.length) return;
 
   const user = await one(env, "SELECT * FROM users WHERE tg_id=?", cat.tg_id);
@@ -374,6 +396,7 @@ async function checkCategory(env, cat) {
     if (!known.has(a.id)) {
       const sig = sigOf(a.title), dsig = dsigOf(a.desc);
       rp = findRepost(a, sig, dsig, a.seller, pool);
+      U.newAds++;
       stmts.push(prep(env,
         "INSERT OR IGNORE INTO ads(ad_id,market,title,price,city,url,photo,descr,seller,cond,photos,params,list_time,first_seen,sig,dsig,score,dev,dup_of) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         a.id, market, a.title, a.price, a.city, a.url, a.photo, a.desc, a.seller, a.cond, a.photos, a.params, a.date, now, sig, dsig, sc.score, sc.dev, rp ? rp.row.ad_id : null));
@@ -404,6 +427,8 @@ async function checkCategory(env, cat) {
     const text = adCard(ad, sc, extra);
     const res = await sendAd(env, cat.tg_id, ad, text, adButtons(env, ad), silent);
     if (res.ok) {
+      U.sent++;
+      hist.push(prep(env, "UPDATE users SET sent_total=COALESCE(sent_total,0)+1 WHERE tg_id=?", cat.tg_id));
       hist.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, ad.id));
       hist.push(prep(env, "INSERT INTO history(tg_id,ad_id,title,price,url,ts) VALUES(?,?,?,?,?,?)", cat.tg_id, ad.id, ad.title, priceStr(ad), ad.url, now));
       if (fwd) await sendAd(env, fwd, ad, text, kb([[{ text: "Открыть на Kufar", url: ad.url }]]), true);
@@ -485,30 +510,63 @@ async function sendReports(env) {
 }
 
 async function runMonitor(env) {
+  const t0 = Date.now();
   await ensureSchema(env);
-  const now = Math.floor(Date.now() / 1000);
+  U.cron++;
+  const now = Math.floor(t0 / 1000);
+  // Resource Guard: при приближении к дневным лимитам второстепенное откладывается, мониторинг остаётся главным
+  const g = await guardInfo(env, true);
+  const level = g.level;
+  const maxCats = level >= 95 ? 1 : level >= 85 ? 2 : MAX_CATS_PER_RUN;
   const cats = await all(env,
     `SELECT c.* FROM categories c JOIN users u ON u.tg_id=c.tg_id
-     WHERE c.active=1 AND u.paused=0 AND c.last_check + c.interval*60 <= ? ORDER BY c.last_check ASC LIMIT ?`, now, MAX_CATS_PER_RUN);
+     WHERE c.active=1 AND u.paused=0 AND u.blocked=0 AND c.last_check + c.interval*60 <= ? ORDER BY c.last_check ASC LIMIT ?`, now, maxCats);
+  let checked = 0, errors = 0;
   for (const cat of cats) {
-    try { await checkCategory(env, cat); } catch (e) { console.log("check error", cat.id, e.message, e.stack); }
+    try { await checkCategory(env, cat); checked++; } catch (e) {
+      errors++;
+      console.log("check error", cat.id, e.message, e.stack);
+      await logEvent(env, "cron_error", cat.tg_id, `категория ${cat.id}: ${e.message}`);
+    }
   }
-  try { await refreshFavorite(env); } catch (e) { console.log("fav error", e.message); }
-  try { await sendReports(env); } catch (e) { console.log("report error", e.message); }
+  if (level < 85) {
+    try { await refreshFavorite(env); } catch (e) { console.log("fav error", e.message); }
+    try { await processBroadcasts(env, (chat, text) => tg(env, "sendMessage", { chat_id: chat, text, disable_web_page_preview: true })); } catch (e) { console.log("broadcast error", e.message); await logEvent(env, "cron_error", null, `рассылка: ${e.message}`); }
+  }
+  if (level < 70) {
+    try { await sendReports(env); } catch (e) { console.log("report error", e.message); }
+  }
   if (Math.random() < 0.01) {
-    // чистим старые данные: объявления старше 90 дней (кроме избранного)
-    const old = now - 90 * 86400;
+    // чистим старое: объявления старше 90 дней (кроме избранного), старые события, метрики и AI-логи
     await env.DB.batch([
-      prep(env, "DELETE FROM ads WHERE first_seen<? AND ad_id NOT IN (SELECT ad_id FROM favs)", old),
+      prep(env, "DELETE FROM ads WHERE first_seen<? AND ad_id NOT IN (SELECT ad_id FROM favs)", now - 90 * 86400),
       prep(env, "DELETE FROM price_hist WHERE ad_id NOT IN (SELECT ad_id FROM ads)"),
+      prep(env, "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 5000)"),
+      prep(env, "DELETE FROM usage WHERE h < ?", new Date((now - 100 * 86400) * 1000).toISOString().slice(0, 13)),
+      prep(env, "DELETE FROM ai_log WHERE ts < ?", now - 30 * 86400),
     ]).catch((e) => console.log("cleanup", e.message));
   }
+  // Предупреждение владельцу при 70/85/95% дневного лимита (по одному разу на уровень в сутки)
+  if (level > 0 && env.OWNER_TELEGRAM_ID) {
+    const key = `guard.alert.${new Date().toISOString().slice(0, 10)}`;
+    if (level > Number(await getSetting(env, key, "0"))) {
+      await setSetting(env, key, level);
+      const what = level >= 95 ? "За запуск проверяется 1 категория, всё второстепенное отложено." : level >= 85 ? "AI, рассылки и проверка избранного приостановлены." : "Отчёты отложены.";
+      await send(env, env.OWNER_TELEGRAM_ID, `⚠️ <b>Resource Guard</b>: израсходовано около ${Math.round(g.pct * 100)}% дневного лимита Cloudflare (порог ${level}%).\n${what}\nМониторинг продолжает работать.`);
+    }
+  }
+  const last = JSON.parse((await getSetting(env, "cron.last", "null")) || "null");
+  if (!last || now - last.ts >= 120 || errors) await setSetting(env, "cron.last", JSON.stringify({ ts: now, ms: Date.now() - t0, cats: checked, errors, level }));
+  await flushUsage(env);
 }
 
 // ───────────────────────── Точки входа ─────────────────────────
 
 export default {
   async fetch(request, env, ctx) {
+    env = withEnv(env); // считаем обращения к D1 для Resource Guard
+    U.requests++;
+    ctx.waitUntil(flushUsage(env));
     const url = new URL(request.url);
     APP_URL = url.origin;
 
@@ -564,6 +622,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    env = withEnv(env);
     ctx.waitUntil(runMonitor(env));
   },
 };
