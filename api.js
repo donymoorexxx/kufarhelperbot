@@ -1,6 +1,6 @@
 // API для Telegram Mini App + каталог категорий. Авторизация — по подписанному initData от Telegram.
 
-import { HttpError, handleAdmin, getSetting, aiAvailable, logEvent, limitsFor, usageFor, redeemPromo, getTiers, HARD_MAX_CATEGORIES } from "./core.js";
+import { HttpError, handleAdmin, getSetting, aiAvailable, aiSelfTest, logEvent, limitsFor, usageFor, redeemPromo, getTiers, HARD_MAX_CATEGORIES } from "./core.js";
 import {
   passes, rowToAd, scoreAd, analogsFor, sigOf, dsigOf, median, mean, jaccard, toCsv, parseFilter, tokens, phraseMatch,
 } from "./logic.js";
@@ -15,26 +15,25 @@ const CATEGORIES = [
   { id: "computers", name: "Компьютерная техника", icon: "🖥️", group: "Электроника", path: "kompyuternaya-tehnika" },
   { id: "tv", name: "Телевизоры", icon: "📺", group: "Электроника", path: "televizory" },
   { id: "games", name: "Игры и приставки", icon: "🎮", group: "Электроника", path: "igry-i-pristavki" },
+  { id: "electronics", name: "Электроника (всё)", icon: "🔌", group: "Электроника", path: "elektronika" },
   { id: "appliances", name: "Бытовая техника", icon: "🧺", group: "Электроника", path: "bytovaya-tehnika" },
-  { id: "furniture", name: "Мебель", icon: "🛋️", group: "Дом", path: "mebel" },
-  { id: "repair", name: "Ремонт и стройка", icon: "🧱", group: "Дом", path: "remont-i-stroitelstvo" },
-  { id: "women", name: "Женская одежда", icon: "👗", group: "Одежда и обувь", path: "zhenskaya-odezhda" },
-  { id: "men", name: "Мужская одежда", icon: "👕", group: "Одежда и обувь", path: "muzhskaya-odezhda" },
-  { id: "shoes", name: "Обувь", icon: "👟", group: "Одежда и обувь", path: "obuv" },
-  { id: "kids", name: "Товары для детей", icon: "🧸", group: "Одежда и обувь", path: "tovary-dlya-detej" },
-  { id: "cars", name: "Автомобили", icon: "🚗", group: "Авто", path: "avtomobili" },
-  { id: "parts", name: "Автозапчасти", icon: "🔧", group: "Авто", path: "avtozapchasti" },
-  { id: "tires", name: "Шины и диски", icon: "🛞", group: "Авто", path: "shiny-i-diski" },
-  { id: "moto", name: "Мототехника", icon: "🏍️", group: "Авто", path: "motocikly" },
-  { id: "bikes", name: "Велосипеды", icon: "🚲", group: "Хобби и спорт", path: "velosipedy" },
-  { id: "sport", name: "Спорт и отдых", icon: "⚽", group: "Хобби и спорт", path: "sport-i-otdyh" },
-  { id: "music", name: "Музыкальные инструменты", icon: "🎸", group: "Хобби и спорт", path: "muzykalnye-instrumenty" },
-  { id: "books", name: "Книги", icon: "📚", group: "Хобби и спорт", path: "knigi" },
-  { id: "pets", name: "Животные", icon: "🐶", group: "Другое", path: "zhivotnye" },
-  { id: "flats", name: "Квартиры", icon: "🏢", group: "Другое", path: "kvartiry" },
-  { id: "jobs", name: "Работа", icon: "💼", group: "Другое", path: "rabota" },
-  { id: "services", name: "Услуги", icon: "🛠️", group: "Другое", path: "uslugi" },
+  { id: "women", name: "Женский гардероб", icon: "👗", group: "Одежда и красота", path: "zhenskij-garderob" },
+  { id: "men", name: "Мужской гардероб", icon: "👕", group: "Одежда и красота", path: "muzhskoj-garderob" },
+  { id: "beauty", name: "Красота и здоровье", icon: "💄", group: "Одежда и красота", path: "krasota-i-zdorovie" },
+  { id: "kids", name: "Всё для детей и мам", icon: "🧸", group: "Одежда и красота", path: "vse-dlya-detej-i-mam" },
+  { id: "furniture", name: "Мебель", icon: "🛋️", group: "Дом и сад", path: "mebel" },
+  { id: "home", name: "Всё для дома", icon: "🏡", group: "Дом и сад", path: "vse-dlya-doma" },
+  { id: "repair", name: "Ремонт и стройка", icon: "🧱", group: "Дом и сад", path: "remont-i-strojka" },
+  { id: "garden", name: "Сад и огород", icon: "🌱", group: "Дом и сад", path: "sad-i-ogorod" },
+  { id: "hobby", name: "Хобби, спорт и туризм", icon: "⚽", group: "Хобби и другое", path: "hobbi-sport-i-turizm" },
+  { id: "wedding", name: "Свадьба и праздники", icon: "🎉", group: "Хобби и другое", path: "svadba-i-prazdniki" },
+  { id: "pets", name: "Животные", icon: "🐶", group: "Хобби и другое", path: "zhivotnye" },
+  { id: "business", name: "Готовый бизнес и оборудование", icon: "🏭", group: "Хобби и другое", path: "gotovyj-biznes-i-oborudovanie" },
+  { id: "jobs", name: "Работа", icon: "💼", group: "Хобби и другое", path: "rabota-biznes-uchjoba" },
+  { id: "services", name: "Услуги", icon: "🛠️", group: "Хобби и другое", path: "uslugi" },
+  { id: "other", name: "Прочее", icon: "📦", group: "Хобби и другое", path: "prochee" },
 ];
+// Авто и недвижимость живут на отдельных сайтах Kufar (auto.kufar.by, re.kufar.by), здесь их нет.
 
 const REGIONS = [
   { id: "all", name: "Вся Беларусь", path: "" },
@@ -140,6 +139,12 @@ export async function handleApi(request, env, url, H) {
       lines.push("", "РЕГИОНЫ:");
       for (const r of REGIONS.slice(1)) { lines.push(`${await check(buildUrl(CATEGORIES[0], r))}  ${r.name}  (${r.path})`); await sleep(500); }
       return new Response(lines.join("\n"), { headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+
+    // Проверка нейросетей: показывает реальную ошибку каждого провайдера и модели: /api/aitest?key=...
+    if (path === "/api/aitest") {
+      if (!isOwner) throw new HttpError("forbidden", 403);
+      return new Response(await aiSelfTest(env), { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     if (path === "/api/discover") {

@@ -274,38 +274,70 @@ function statusOf(e) {
   return 0;
 }
 
+// Запасные бесплатные модели Workers AI (список бесплатных моделей: changelog Cloudflare от 28.07.2026)
+const WORKERS_AI_FALLBACKS = ["@cf/zai-org/glm-4.7-flash", "@cf/nvidia/nemotron-3-120b-a12b", "@cf/meta/llama-3.1-8b-instruct"];
+const asText = (x) => (x && typeof x === "object" ? JSON.stringify(x) : x);
+
+// Возвращает варианты текста ответа (у «думающих» моделей JSON может оказаться в разных полях)
 async function callProvider(env, p, model, system, user, maxTokens) {
   if (p === "workers_ai") {
-    const r = await env.AI.run(model, { messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0.2 });
-    let t = typeof r === "string" ? r : r?.response ?? r?.choices?.[0]?.message?.content ?? r?.result?.response;
-    if (t && typeof t === "object") t = JSON.stringify(t);
-    if (!t) throw new AiError("пустой ответ Workers AI");
-    return String(t);
+    // запас токенов: «думающие» модели тратят часть на рассуждения и иначе возвращают пустой ответ
+    const r = await env.AI.run(model, { messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: Math.max(maxTokens, 2500), temperature: 0.2 });
+    const m = r?.choices?.[0]?.message;
+    const out = [m?.content, r?.response, r?.result?.response, m?.reasoning_content, m?.reasoning, typeof r === "string" ? r : null].map(asText).filter((x) => typeof x === "string" && x.trim());
+    if (!out.length) throw new AiError("пустой ответ модели (поля ответа: " + (r && typeof r === "object" ? Object.keys(r).join(",") : typeof r) + ")");
+    return out;
   }
   if (p === "gemini") {
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: user }] }], generationConfig: { maxOutputTokens: maxTokens, temperature: 0.2, responseMimeType: "application/json" } }),
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: user }] }], generationConfig: { maxOutputTokens: Math.max(maxTokens, 1500), temperature: 0.2, responseMimeType: "application/json" } }),
     });
     if (!r.ok) throw new AiError(`Gemini HTTP ${r.status}`, r.status);
     const j = await r.json();
-    return (j.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("");
+    return [(j.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("")];
   }
   const url = p === "groq" ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
   const key = p === "groq" ? env.GROQ_API_KEY : env.OPENROUTER_API_KEY;
   const r = await fetch(url, {
     method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}`, "X-Title": "Kufar Helper" },
-    body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0.2 }),
+    body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: Math.max(maxTokens, 1500), temperature: 0.2 }),
   });
   if (!r.ok) throw new AiError(`${PROVIDERS[p].name} HTTP ${r.status}`, r.status);
   const j = await r.json();
-  return j.choices?.[0]?.message?.content || "";
+  const m = j.choices?.[0]?.message;
+  return [m?.content, m?.reasoning_content].filter((x) => typeof x === "string" && x.trim());
 }
 
-function parseJson(text) {
-  const m = String(text).replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
-  if (!m) throw new AiError("ответ не в формате JSON");
-  try { return JSON.parse(m[0]); } catch { throw new AiError("ответ не удалось разобрать как JSON"); }
+function parseJson(texts) {
+  for (const t of Array.isArray(texts) ? texts : [texts]) {
+    const m = String(t).replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
+    if (!m) continue;
+    try { return JSON.parse(m[0]); } catch {}
+  }
+  throw new AiError("ответ не в формате JSON");
+}
+
+// Проверка всех подключённых провайдеров и моделей: /api/aitest?key=<WEBHOOK_SECRET>
+export async function aiSelfTest(env) {
+  const lines = [];
+  for (const p of Object.keys(PROVIDERS)) {
+    if (!PROVIDERS[p].ok(env)) { lines.push(`—    ${p}: не подключён`); continue; }
+    const primary = await modelFor(env, p);
+    const models = p === "workers_ai" ? [primary, ...WORKERS_AI_FALLBACKS.filter((x) => x !== primary)] : [primary];
+    for (const m of models) {
+      const t0 = Date.now();
+      try {
+        const texts = await callProvider(env, p, m, "Верни только JSON без пояснений.", 'Верни {"ok":true,"город":"Минск"}', 300);
+        let ok = true;
+        try { parseJson(texts); } catch { ok = false; }
+        lines.push(`${ok ? "OK  " : "??  "} ${p} ${m} ${Date.now() - t0} мс | ${String(texts[0]).slice(0, 160).replace(/\s+/g, " ")}`);
+      } catch (e) {
+        lines.push(`FAIL ${p} ${m} ${Date.now() - t0} мс | код ${statusOf(e)} | ${e.name}: ${String(e.message).slice(0, 300)}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 export function hashStr(s) {
@@ -314,7 +346,7 @@ export function hashStr(s) {
   return (h >>> 0).toString(36);
 }
 
-// Единая точка вызова нейросети: проверка отключения, кэш, ресурсы, перебор провайдеров (по одному разу каждый)
+// Единая точка вызова нейросети: проверка отключения, кэш, ресурсы, перебор провайдеров и моделей (каждая пробуется один раз)
 export async function aiJson(env, task, system, user, opts = {}) {
   const { maxTokens = 800, cacheKey = null, tgId = null } = opts;
   if ((await getSetting(env, `ai.feature.${task}`, "1")) === "0") throw new AiError("Эта AI-функция отключена администратором", 403);
@@ -325,39 +357,51 @@ export async function aiJson(env, task, system, user, opts = {}) {
   if ((await guardLevel(env)) >= 85) throw new AiError("AI отложен: близок лимит ресурсов Cloudflare. Мониторинг продолжает работать, попробуй позже.", 503);
 
   const now = Math.floor(Date.now() / 1000);
-  const usable = [];
+  const attempts = [];
   for (const p of await providerOrder(env)) {
     if (!PROVIDERS[p].ok(env)) continue;
     if ((await getSetting(env, `ai.enabled.${p}`, "1")) === "0") continue;
     if (Number(await getSetting(env, `ai.cool.${p}`, "0")) > now) continue;
-    usable.push(p);
+    const primary = await modelFor(env, p);
+    if (p === "workers_ai") for (const m of [primary, ...WORKERS_AI_FALLBACKS.filter((x) => x !== primary)]) attempts.push([p, m]);
+    else attempts.push([p, primary]);
   }
-  if (!usable.length) throw new AiError("Нет доступных бесплатных AI-провайдеров (не подключены, отключены или исчерпали лимит)", 503);
+  if (!attempts.length) throw new AiError("Нет доступных бесплатных AI-провайдеров (не подключены, отключены или исчерпали лимит)", 503);
 
-  let last = null;
-  for (let i = 0; i < usable.length; i++) {
-    const p = usable[i], model = await modelFor(env, p), t0 = Date.now();
+  const stat = {}, failures = [];
+  const settle = async () => {
+    // провайдер, у которого все попытки закончились 429, отдыхает: минуту, а при исчерпании суточного лимита до полуночи UTC
+    for (const [p, s] of Object.entries(stat)) {
+      if (s.n > 0 && s.n === s.n429) {
+        const until = s.daily ? Math.floor(Date.now() / 86400000 + 1) * 86400 : now + 60;
+        await setSetting(env, `ai.cool.${p}`, until).catch(() => {});
+      }
+    }
+  };
+  for (let i = 0; i < attempts.length; i++) {
+    const [p, model] = attempts[i], t0 = Date.now();
     const log = (ok, status, err) => env.DB.prepare("INSERT INTO ai_log(ts,provider,model,task,ok,status,ms,fallback,tg_id,err) VALUES(?,?,?,?,?,?,?,?,?,?)")
       .bind(now, p, model, task, ok ? 1 : 0, status, Date.now() - t0, i > 0 ? 1 : 0, tgId, err ? String(err).slice(0, 200) : null).run().catch(() => {});
     U.ai++;
     try {
       const data = parseJson(await callProvider(env, p, model, system, user, maxTokens));
       await log(true, 200, null);
+      await settle();
       if (cacheKey) await setSetting(env, `aic.${cacheKey}`, JSON.stringify(data)).catch(() => {});
       return data;
     } catch (e) {
-      last = e;
       const st = statusOf(e);
       await log(false, st, e.message);
-      if (st === 429) {
-        const daily = /neurons|daily|3036|4006/i.test(e.message);
-        const until = daily ? Math.floor(Date.now() / 86400000 + 1) * 86400 : now + 60;
-        await setSetting(env, `ai.cool.${p}`, until).catch(() => {});
-      }
-      await logEvent(env, "ai_error", tgId, `${p}: ${e.message}`);
+      const s = (stat[p] = stat[p] || { n: 0, n429: 0, daily: false });
+      s.n++;
+      if (st === 429) { s.n429++; if (/neurons|daily|3036|4006/i.test(e.message)) s.daily = true; }
+      failures.push(`${p} ${model.split("/").pop()}: ${String(e.message).slice(0, 90)}`);
+      await logEvent(env, "ai_error", tgId, `${p} ${model}: ${e.message}`);
     }
   }
-  throw new AiError("Все бесплатные AI-провайдеры сейчас недоступны или исчерпали лимиты. Мониторинг работает как обычно.", 503);
+  await settle();
+  const owner = tgId != null && env.OWNER_TELEGRAM_ID && String(tgId) === String(env.OWNER_TELEGRAM_ID);
+  throw new AiError("Все бесплатные AI-провайдеры сейчас недоступны или исчерпали лимиты. Мониторинг работает как обычно." + (owner ? "\nДетали для владельца: " + failures.slice(0, 4).join("; ") : ""), 503);
 }
 
 // ───────── Рассылки: отправка порциями по Cron ─────────

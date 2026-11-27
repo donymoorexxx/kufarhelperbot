@@ -131,17 +131,24 @@ function findAds(node, out) {
   }
 }
 
-// подпись параметра: сначала человекочитаемое v, потом значение vl
-function param(ad, ...names) {
-  const p = (ad.ad_parameters || []).find((x) => names.includes(x.p));
-  const v = p ? (p.v ?? p.vl) : null;
-  return Array.isArray(v) ? v.join(", ") : v;
+// Человекочитаемая подпись параметра: берём текстовое значение (не код вроде «3» или «2, 5»)
+function paramLabel(ad, ...names) {
+  for (const name of names) {
+    const p = (ad.ad_parameters || []).find((x) => x.p === name);
+    if (!p) continue;
+    for (const k of ["vl", "v"]) {
+      const arr = Array.isArray(p[k]) ? p[k] : [p[k]];
+      const words = arr.filter((y) => typeof y === "string" && y.trim() && !/^[\d\s,.\-]+$/.test(y)).map((y) => y.trim());
+      if (words.length) return words.join(", ");
+    }
+  }
+  return null;
 }
 
 function normalize(ad) {
   const pr = Number(ad.price_byn);
   const img = Array.isArray(ad.images) && ad.images[0]?.path;
-  const city = [param(ad, "region"), param(ad, "area")].filter(Boolean).join(", ");
+  const city = [paramLabel(ad, "region"), paramLabel(ad, "area")].filter(Boolean).join(", ");
   return {
     id: String(ad.ad_id),
     title: String(ad.subject || "Без названия").slice(0, 160),
@@ -152,7 +159,7 @@ function normalize(ad) {
     url: ad.ad_link,
     photo: img ? `https://rms.kufar.by/v1/list_thumbs_2x/${img}` : null,
     seller: ad.account_id != null ? String(ad.account_id) : null,
-    cond: param(ad, "condition") != null ? String(param(ad, "condition")) : null,
+    cond: paramLabel(ad, "condition"),
     photos: Array.isArray(ad.images) ? ad.images.length : 0,
     params: Array.isArray(ad.ad_parameters) ? ad.ad_parameters.length : 0,
   };
@@ -167,7 +174,9 @@ async function fetchAds(url) {
   const found = [];
   findAds(JSON.parse(m[1]), found);
   const seen = new Set();
-  return found.map(normalize).filter((a) => !seen.has(a.id) && seen.add(a.id));
+  const list = found.map(normalize).filter((a) => !seen.has(a.id) && seen.add(a.id));
+  list.raw = found.slice(0, 2).map((a) => ({ keys: Object.keys(a), ad_parameters: a.ad_parameters })); // для диагностики /test
+  return list;
 }
 
 // Цена именно этого объявления (а не похожих на странице): ищем объект с тем же ad_id
@@ -617,7 +626,7 @@ export default {
       if (!authorized) return new Response("Нужен ?key=<WEBHOOK_SECRET>", { status: 403 });
       try {
         const ads = await fetchAds(url.searchParams.get("url") || "");
-        return Response.json({ ok: true, count: ads.length, first: ads.slice(0, 3).map((a) => ({ title: a.title, price: a.price, city: a.city, seller: a.seller, cond: a.cond })) });
+        return Response.json({ ok: true, count: ads.length, first: ads.slice(0, 3).map((a) => ({ title: a.title, price: a.price, city: a.city, seller: a.seller, cond: a.cond, photos: a.photos })), raw: ads.raw });
       } catch (e) {
         return Response.json({ ok: false, error: e.message });
       }
