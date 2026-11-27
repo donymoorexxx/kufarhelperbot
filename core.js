@@ -275,7 +275,8 @@ function statusOf(e) {
 }
 
 // Запасные бесплатные модели Workers AI (список бесплатных моделей: changelog Cloudflare от 28.07.2026)
-const WORKERS_AI_FALLBACKS = ["@cf/zai-org/glm-4.7-flash", "@cf/nvidia/nemotron-3-120b-a12b", "@cf/meta/llama-3.1-8b-instruct"];
+// Закрытые Cloudflare модели (nemotron-3-120b — 20.11.2026, llama-3.1-8b-instruct — 30.05.2026) убраны; быстрые llama без «рассуждений» взяты из актуального каталога
+const WORKERS_AI_FALLBACKS = ["@cf/zai-org/glm-4.7-flash", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "@cf/meta/llama-3.1-8b-instruct-fp8", "@cf/meta/llama-4-scout-17b-16e-instruct"];
 const asText = (x) => (x && typeof x === "object" ? JSON.stringify(x) : x);
 
 // Возвращает варианты текста ответа (у «думающих» моделей JSON может оказаться в разных полях)
@@ -293,7 +294,7 @@ async function callProvider(env, p, model, system, user, maxTokens) {
       method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
       body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: user }] }], generationConfig: { maxOutputTokens: Math.max(maxTokens, 1500), temperature: 0.2, responseMimeType: "application/json" } }),
     });
-    if (!r.ok) throw new AiError(`Gemini HTTP ${r.status}`, r.status);
+    if (!r.ok) throw new AiError(`Gemini HTTP ${r.status}: ${(await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 220)}`, r.status);
     const j = await r.json();
     return [(j.candidates?.[0]?.content?.parts || []).map((x) => x.text || "").join("")];
   }
@@ -303,7 +304,7 @@ async function callProvider(env, p, model, system, user, maxTokens) {
     method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}`, "X-Title": "Kufar Helper" },
     body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: Math.max(maxTokens, 1500), temperature: 0.2 }),
   });
-  if (!r.ok) throw new AiError(`${PROVIDERS[p].name} HTTP ${r.status}`, r.status);
+  if (!r.ok) throw new AiError(`${PROVIDERS[p].name} HTTP ${r.status}: ${(await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 220)}`, r.status);
   const j = await r.json();
   const m = j.choices?.[0]?.message;
   return [m?.content, m?.reasoning_content].filter((x) => typeof x === "string" && x.trim());

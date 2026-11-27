@@ -212,6 +212,13 @@ function normalizeAnalysis(j, nAnalogs) {
   return out;
 }
 
+// Проверка полного анализа на примере (без записи в базу): /api/aitest?key=...&full=1
+export async function analyzeSample(env) {
+  const user = "Название: iPhone 13 128GB\nЦена: 1100 BYN\nГород: Минск\nСостояние (поле объявления): Б/у\nКоличество фото: 4\nКоличество указанных параметров: 3\n" +
+    "Описание продавца: Телефон в хорошем состоянии, аккумулятор 87%, есть коробка и зарядка. Без торга.\nИстория цены: не менялась\nСопоставимых объявлений недостаточно (0), положение относительно рынка оценить нельзя.";
+  return normalizeAnalysis(await aiJson(env, "analysis", ANALYSIS_SYSTEM, user, { maxTokens: 900, tgId: Number(env.OWNER_TELEGRAM_ID) || null }), 0);
+}
+
 // Анализ с кэшем в D1: повторно считается, только если объявление или цена заметно изменились либо прошла неделя
 export async function analyzeAd(env, row, tgId = null) {
   const ad = rowToAd(row);

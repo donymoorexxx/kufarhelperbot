@@ -2,7 +2,7 @@
 
 import { HttpError, handleAdmin, getSetting, aiAvailable, aiSelfTest, logEvent, limitsFor, usageFor, redeemPromo, getTiers, HARD_MAX_CATEGORIES } from "./core.js";
 import {
-  passes, rowToAd, scoreAd, analogsFor, sigOf, dsigOf, median, mean, jaccard, toCsv, parseFilter, tokens, phraseMatch,
+  analyzeSample, passes, rowToAd, scoreAd, analogsFor, sigOf, dsigOf, median, mean, jaccard, toCsv, parseFilter, tokens, phraseMatch,
 } from "./logic.js";
 
 // ───────── Каталог категорий и регионов ─────────
@@ -144,7 +144,13 @@ export async function handleApi(request, env, url, H) {
     // Проверка нейросетей: показывает реальную ошибку каждого провайдера и модели: /api/aitest?key=...
     if (path === "/api/aitest") {
       if (!isOwner) throw new HttpError("forbidden", 403);
-      return new Response(await aiSelfTest(env), { headers: { "content-type": "text/plain; charset=utf-8" } });
+      let out = await aiSelfTest(env);
+      if (url.searchParams.get("full") === "1") {
+        const t0 = Date.now();
+        try { out += `\n\nПОЛНЫЙ АНАЛИЗ ПРИМЕРА: OK за ${Date.now() - t0} мс\n` + JSON.stringify(await analyzeSample(env)).slice(0, 700); }
+        catch (e) { out += `\n\nПОЛНЫЙ АНАЛИЗ ПРИМЕРА: FAIL за ${Date.now() - t0} мс\n${e.message}`; }
+      }
+      return new Response(out, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     if (path === "/api/discover") {
