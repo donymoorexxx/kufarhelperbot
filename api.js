@@ -1,6 +1,6 @@
 // API для Telegram Mini App + каталог категорий. Авторизация — по подписанному initData от Telegram.
 
-import { HttpError, handleAdmin, getSetting, aiAvailable, logEvent } from "./core.js";
+import { HttpError, handleAdmin, getSetting, aiAvailable, logEvent, limitsFor, usageFor, redeemPromo, getTiers, HARD_MAX_CATEGORIES } from "./core.js";
 import {
   passes, rowToAd, scoreAd, analogsFor, sigOf, dsigOf, median, mean, jaccard, toCsv, parseFilter, tokens, phraseMatch,
 } from "./logic.js";
@@ -54,7 +54,6 @@ const REGIONS = [
 
 const buildUrl = (cat, region) => `https://www.kufar.by/l/${region.path ? region.path + "/" : ""}${cat.path}`;
 
-const MAX_CATEGORIES_PER_USER = 20;
 const enc = new TextEncoder();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -120,7 +119,7 @@ export async function handleApi(request, env, url, H) {
     const key = url.searchParams.get("key");
     const isOwner = env.WEBHOOK_SECRET && key === env.WEBHOOK_SECRET;
 
-    if (path === "/api/catalog") return json({ categories: CATEGORIES, regions: REGIONS });
+    if (path === "/api/catalog") return json({ categories: CATEGORIES, regions: REGIONS, tiers: [...(await getTiers(env)).values()].map((t) => ({ id: t.id, name: t.name, limits: t.limits })) });
 
     // Проверка адресов каталога по очереди (Kufar отвечает 429 на частые запросы): /api/diag?key=...
     if (path === "/api/diag") {
@@ -168,6 +167,8 @@ export async function handleApi(request, env, url, H) {
     const user = await ensureUser(env, uid, tgUser);
     if (user.blocked && !owner) throw new HttpError("Доступ ограничен администратором", 403);
     if (!owner && (await getSetting(env, "maintenance", "0")) === "1") throw new HttpError("Идут технические работы. Мониторинг продолжает работать, приложение скоро вернётся.", 503);
+    const T = await limitsFor(env, user); // действующий тариф: проверки лимитов только здесь, на сервере
+    const lock = (flag, what) => { if (!T.limits[flag]) throw new HttpError(`«${what}» недоступно на тарифе ${T.name}. Открой на более высоком тарифе или по промокоду.`, 403); };
     if (!user.last_seen || now - user.last_seen > 3600) await logEvent(env, "login", uid, tgUser.username ? "@" + tgUser.username : tgUser.first_name || "");
     const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
     const q = url.searchParams;
@@ -188,7 +189,8 @@ export async function handleApi(request, env, url, H) {
          JOIN (SELECT ad_id, MIN(category_id) AS category_id FROM seen WHERE category_id IN (SELECT id FROM categories WHERE tg_id=?) GROUP BY ad_id) s ON s.ad_id=a.ad_id
          JOIN categories c ON c.id=s.category_id
          LEFT JOIN favs f ON f.ad_id=a.ad_id AND f.tg_id=?
-         ORDER BY a.first_seen DESC LIMIT ?`, uid, uid, limit);
+         WHERE a.first_seen >= ?
+         ORDER BY a.first_seen DESC LIMIT ?`, uid, uid, now - T.limits.history_days * 86400, limit); // глубина истории по тарифу
       return rows.filter((r) => passes(rowToAd(r), { min_price: r.f_min, max_price: r.f_max, city: r.f_city, keywords: r.f_kw, exclude: r.f_ex, condition: r.f_cond }, user));
     };
 
@@ -205,6 +207,7 @@ export async function handleApi(request, env, url, H) {
         },
         categories,
         stats: { found24: f24.c, favs: favs.c, active: categories.filter((c) => c.active).length },
+        tier: { id: T.id, name: T.name, until: T.until, unlimited: T.unlimited, limits: T.limits, usage: await usageFor(env, user) },
       });
     }
 
@@ -212,9 +215,14 @@ export async function handleApi(request, env, url, H) {
       const cat = CATEGORIES.find((c) => c.id === body.category);
       const region = REGIONS.find((r) => r.id === (body.region || "all"));
       if (!cat || !region) throw new HttpError("Категория не найдена");
-      const count = (await one(env, "SELECT COUNT(*) c FROM categories WHERE tg_id=?", uid)).c;
-      if (count >= MAX_CATEGORIES_PER_USER) throw new HttpError(`Не больше ${MAX_CATEGORIES_PER_USER} категорий`);
+      const usage = await usageFor(env, user);
+      if (usage.categories >= Math.min(T.limits.max_categories, HARD_MAX_CATEGORIES)) throw new HttpError(`Лимит категорий на тарифе ${T.name}: ${T.limits.max_categories}. Удали лишнюю или повысь тариф.`, 403);
       const fields = cleanFields({ interval: user.interval, ...(body.filters || {}) });
+      if (usage.profiles >= T.limits.max_profiles && !(await one(env, "SELECT 1 x FROM categories WHERE tg_id=? AND COALESCE(profile,'')=?", uid, fields.profile ?? ""))) {
+        throw new HttpError(`Лимит профилей поиска на тарифе ${T.name}: ${T.limits.max_profiles}.`, 403);
+      }
+      let adjusted = null;
+      if (fields.interval < T.limits.min_interval) { fields.interval = T.limits.min_interval; adjusted = fields.interval; }
       const onlyNew = body.only_new !== false;
       const catUrl = buildUrl(cat, region);
       let ads;
@@ -249,23 +257,32 @@ export async function handleApi(request, env, url, H) {
         if (onlyNew) stmts.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", id, a.id));
       }
       await batchChunks(env, stmts);
-      return json({ ok: true, id, existing: ads.length });
+      return json({ ok: true, id, existing: ads.length, interval_adjusted: adjusted });
     }
 
     if (path === "/api/update") {
       const owned = await one(env, "SELECT id FROM categories WHERE id=? AND tg_id=?", body.id, uid);
       if (!owned) throw new HttpError("Категория не найдена", 404);
       const fields = cleanFields(body.fields || {});
+      let adjusted = null;
+      if (fields.interval < T.limits.min_interval) { fields.interval = T.limits.min_interval; adjusted = fields.interval; }
+      if ("profile" in fields) {
+        const others = await one(env, "SELECT COUNT(DISTINCT COALESCE(profile,'')) c FROM categories WHERE tg_id=? AND id!=?", uid, body.id);
+        const same = await one(env, "SELECT 1 x FROM categories WHERE tg_id=? AND id!=? AND COALESCE(profile,'')=?", uid, body.id, fields.profile ?? "");
+        if (others.c + (same ? 0 : 1) > T.limits.max_profiles) throw new HttpError(`Лимит профилей поиска на тарифе ${T.name}: ${T.limits.max_profiles}.`, 403);
+      }
       const keys = Object.keys(fields);
       if (keys.length) await run(env, `UPDATE categories SET ${keys.map((k) => k + "=?").join(",")} WHERE id=? AND tg_id=?`, ...keys.map((k) => fields[k]), body.id, uid);
-      return json({ ok: true });
+      return json({ ok: true, interval_adjusted: adjusted });
     }
 
     // Массовое изменение фильтров у выбранных категорий
     if (path === "/api/bulk") {
-      const idsIn = (Array.isArray(body.ids) ? body.ids : []).map(Number).filter(Number.isInteger).slice(0, MAX_CATEGORIES_PER_USER);
+      const idsIn = (Array.isArray(body.ids) ? body.ids : []).map(Number).filter(Number.isInteger).slice(0, HARD_MAX_CATEGORIES);
       if (!idsIn.length) throw new HttpError("Не выбрано ни одной категории");
       const fields = cleanFields(body.fields || {});
+      delete fields.profile; // профили меняются по одному, с проверкой лимита
+      if (fields.interval < T.limits.min_interval) fields.interval = T.limits.min_interval;
       const keys = Object.keys(fields);
       if (!keys.length) throw new HttpError("Нечего менять");
       await env.DB.batch(idsIn.map((id) => prep(env, `UPDATE categories SET ${keys.map((k) => k + "=?").join(",")} WHERE id=? AND tg_id=?`, ...keys.map((k) => fields[k]), id, uid)));
@@ -291,15 +308,17 @@ export async function handleApi(request, env, url, H) {
         await run(env, "UPDATE users SET paused=? WHERE tg_id=?", body.paused ? 1 : 0, uid);
         if (!body.paused) await run(env, "UPDATE categories SET since=?, last_check=0 WHERE tg_id=? AND active=1", body.skip_old ? now : null, uid);
       }
-      if ("interval" in body) await run(env, "UPDATE users SET interval=? WHERE tg_id=?", cleanFields({ interval: body.interval }).interval, uid);
+      if ("interval" in body) await run(env, "UPDATE users SET interval=? WHERE tg_id=?", Math.max(cleanFields({ interval: body.interval }).interval, T.limits.min_interval), uid);
       if ("quiet" in body) await run(env, "UPDATE users SET quiet=? WHERE tg_id=?", body.quiet ? 1 : 0, uid);
       if ("report" in body) {
         if (!["off", "daily", "weekly"].includes(body.report)) throw new HttpError("Неверный период отчёта");
+        if (body.report !== "off") lock("reports", "Отчёты в чат");
         await run(env, "UPDATE users SET report=? WHERE tg_id=?", body.report, uid);
       }
       if ("forward_chat" in body) {
         const v = body.forward_chat === "" || body.forward_chat == null ? null : Number(body.forward_chat);
         if (v !== null && !Number.isSafeInteger(v)) throw new HttpError("ID чата должен быть числом");
+        if (v !== null) lock("forward", "Пересылка в другой чат");
         await run(env, "UPDATE users SET forward_chat=? WHERE tg_id=?", v, uid);
       }
       if ("bl_words" in body) await run(env, "UPDATE users SET bl_words=? WHERE tg_id=?", String(body.bl_words || "").slice(0, 500) || null, uid);
@@ -368,6 +387,11 @@ export async function handleApi(request, env, url, H) {
       });
     }
 
+    if (path === "/api/promo") {
+      const r = await redeemPromo(env, uid, body.code);
+      return json({ ok: true, ...r });
+    }
+
     if (path === "/api/fav") {
       const row = await one(env, "SELECT ad_id, price FROM ads WHERE ad_id=?", String(body.id || ""));
       if (!row) throw new HttpError("Объявление не найдено", 404);
@@ -387,6 +411,7 @@ export async function handleApi(request, env, url, H) {
 
     // Аналитика только по реально собранным данным
     if (path === "/api/analytics") {
+      lock("analytics", "Аналитика");
       const days = [7, 30, 90].includes(Number(q.get("days"))) ? Number(q.get("days")) : 30;
       const since = now - days * 86400;
       const cats = await all(env, "SELECT id, title, cat_key, market FROM categories WHERE tg_id=?", uid);
@@ -427,6 +452,7 @@ export async function handleApi(request, env, url, H) {
 
     // Экспорт в CSV: файл приходит в чат с ботом (Excel открывает такой файл)
     if (path === "/api/export") {
+      lock("export", "Экспорт данных");
       const rows = await userAds(2000);
       if (!rows.length) throw new HttpError("Пока нечего экспортировать");
       const csv = toCsv(rows.map((r) => ({ ...r, found: new Date(r.first_seen * 1000).toISOString().slice(0, 16).replace("T", " ") })), [

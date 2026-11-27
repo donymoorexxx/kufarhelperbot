@@ -7,7 +7,7 @@ import {
   analyzeAd, aiText, rowToAd, money, median,
 } from "./logic.js";
 
-import { withEnv, U, flushUsage, getSetting, setSetting, logEvent, guardInfo, coreSchema, coreAlters, processBroadcasts } from "./core.js";
+import { withEnv, U, flushUsage, getSetting, setSetting, logEvent, guardInfo, coreSchema, coreAlters, processBroadcasts, limitsFor } from "./core.js";
 
 let APP_URL = ""; // адрес воркера для кнопок открытия Mini App
 
@@ -377,7 +377,8 @@ async function checkCategory(env, cat) {
   if (!fresh.length && !changed.length) return;
 
   const silent = !!user?.quiet;
-  const fwd = user?.forward_chat;
+  const T = await limitsFor(env, user);
+  const fwd = T.limits.forward ? user?.forward_chat : null; // пересылка доступна не на всех тарифах
   const notOld = (a) => {
     if (!cat.since || !a.date) return true;
     const t = Date.parse(a.date) / 1000;
@@ -490,8 +491,9 @@ async function sendReports(env) {
   const mt = new Date(Date.now() + 3 * 3600e3);
   const date = mt.toISOString().slice(0, 10);
   if (mt.getUTCHours() < 9) return;
-  const users = await all(env, "SELECT tg_id, report FROM users WHERE report IN ('daily','weekly') AND (report_last IS NULL OR report_last != ?) LIMIT 5", date);
+  const users = await all(env, "SELECT * FROM users WHERE report IN ('daily','weekly') AND (report_last IS NULL OR report_last != ?) LIMIT 5", date);
   for (const u of users) {
+    if (!(await limitsFor(env, u)).limits.reports) { await run(env, "UPDATE users SET report_last=? WHERE tg_id=?", date, u.tg_id); continue; }
     if (u.report === "weekly" && mt.getUTCDay() !== 1) continue;
     const days = u.report === "weekly" ? 7 : 1;
     const since = Math.floor(Date.now() / 1000) - days * 86400;
@@ -520,7 +522,10 @@ async function runMonitor(env) {
   const maxCats = level >= 95 ? 1 : level >= 85 ? 2 : MAX_CATS_PER_RUN;
   const cats = await all(env,
     `SELECT c.* FROM categories c JOIN users u ON u.tg_id=c.tg_id
-     WHERE c.active=1 AND u.paused=0 AND u.blocked=0 AND c.last_check + c.interval*60 <= ? ORDER BY c.last_check ASC LIMIT ?`, now, maxCats);
+     LEFT JOIN tiers t ON t.id = (CASE WHEN u.tier_until IS NOT NULL AND u.tier_until < ? THEN 'free' ELSE COALESCE(u.tier,'free') END)
+     WHERE c.active=1 AND u.paused=0 AND u.blocked=0
+       AND c.last_check + MAX(c.interval, CASE WHEN u.tg_id=? THEN 1 ELSE COALESCE(CAST(json_extract(t.limits,'$.min_interval') AS INTEGER),1) END)*60 <= ?
+     ORDER BY c.last_check ASC LIMIT ?`, now, Number(env.OWNER_TELEGRAM_ID) || 0, now, maxCats); // интервал не короче минимума тарифа
   let checked = 0, errors = 0;
   for (const cat of cats) {
     try { await checkCategory(env, cat); checked++; } catch (e) {

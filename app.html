@@ -92,7 +92,7 @@ function applyTheme(p) {
 }
 applyTheme(themePref);
 
-const S = { tab: "home", sub: null, ready: false, error: null, cats: [], regions: [], mine: [], user: {}, stats: {}, theme: themePref,
+const S = { tiers: [], tab: "home", sub: null, ready: false, error: null, cats: [], regions: [], mine: [], user: {}, stats: {}, theme: themePref,
   feed: [], feedTotal: 0, feedMode: "best", sort: "score", q: "", home: [], favs: [], an: null, anDays: 30, sheet: null, bulk: false, sel: new Set(), saving: false, nl: null, nlText: "", catQ: "", adm: { sec: "dash", period: "7d", data: null, err: null, q: "", offset: 0, type: "", user: "", from: "", to: "", bctext: "", bcaud: "all", bcprev: null } };
 const INTERVALS = [1, 5, 10, 30, 60];
 const $ = (s) => document.querySelector(s);
@@ -115,20 +115,23 @@ async function run(fn) { try { await fn(); } catch (e) { haptic("error"); toast(
 async function load() {
   try {
     const [cat, st] = await Promise.all([api("catalog"), api("state")]);
-    S.cats = cat.categories; S.regions = cat.regions; S.mine = st.categories; S.user = st.user; S.stats = st.stats; S.ready = true; S.error = null;
+    S.cats = cat.categories; S.regions = cat.regions; S.tiers = cat.tiers; S.mine = st.categories; S.user = st.user; S.stats = st.stats; S.ready = true; S.error = null;
     S.home = (await api("feed?mode=best&limit=3")).items;
   } catch (e) { S.error = e.message; S.ready = true; }
   render();
 }
 async function loadFeed() { const j = await api("feed?mode=" + S.feedMode + "&sort=" + S.sort + "&q=" + encodeURIComponent(S.q)); S.feed = j.items; S.feedTotal = j.total; }
 async function loadFavs() { S.favs = (await api("favs")).items; }
-async function loadAn() { S.an = await api("analytics?days=" + S.anDays); }
+async function loadAn() { try { S.an = await api("analytics?days=" + S.anDays); } catch (e) { S.an = { days: S.anDays, items: [], locked: e.message }; } }
 async function loadAdmin() {
   const a = S.adm, qs = (o) => Object.entries(o).filter(([, v]) => v !== "" && v != null).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
   const paths = { dash: "admin/dashboard?period=" + a.period, users: "admin/users?" + qs({ q: a.q, offset: a.offset }), ai: "admin/ai", mon: "admin/monitoring", res: "admin/resources",
-    fin: "admin/finance", bc: "admin/broadcast", logs: "admin/logs?" + qs({ type: a.type, user: a.user, from: a.from, to: a.to }), set: "admin/settings" };
+    tar: "admin/tariffs", fin: "admin/finance", bc: "admin/broadcast", logs: "admin/logs?" + qs({ type: a.type, user: a.user, from: a.from, to: a.to }), set: "admin/settings" };
   a.err = null;
-  try { a.data = await api(paths[a.sec]); } catch (e) { a.data = null; a.err = e.message; }
+  try {
+    a.data = await api(paths[a.sec]);
+    if (a.sec === "tar") a.data.promos = (await api("admin/promos")).items;
+  } catch (e) { a.data = null; a.err = e.message; }
   render();
 }
 async function refreshState() { const st = await api("state"); S.mine = st.categories; S.user = st.user; S.stats = st.stats; }
@@ -252,6 +255,7 @@ function viewAnalytics() {
   const head = '<div class="h2row"><h2>Аналитика</h2><button class="btn ghost sm" data-act="backmore">Назад</button></div><div class="chips big" style="margin:0 0 12px">' +
     [7, 30, 90].map((d) => '<button class="chip ' + (S.anDays === d ? "sel" : "") + '" data-act="andays" data-v="' + d + '">' + d + " дн.</button>").join("") + "</div>";
   if (!S.an) return head + '<div class="center">Считаю…</div>';
+  if (S.an.locked) return head + '<div class="empty"><div class="big">🔒</div><div class="title">Недоступно на твоём тарифе</div><div class="sub">' + esc(S.an.locked) + "</div></div>";
   if (!S.an.items.length) return head + '<div class="empty"><div class="big">📊</div><div class="title">Данных пока нет</div><div class="sub">Добавь категорию, и бот начнёт собирать цены. Графики строятся только по реально собранным данным.</div></div>';
   return head + S.an.items.map((m) => {
     const days = m.series.map((s) => s.n), avgs = m.series.filter((s) => s.avg != null).map((s, i) => ({ x: i, y: s.avg }));
@@ -279,10 +283,25 @@ function viewNl() {
     '<div class="hint">Перед сохранением ты увидишь результат и подтвердишь его.</div>';
 }
 
+function tierCard() {
+  const t = S.user.tier; if (!t) return "";
+  const L = t.limits, u = t.usage, yes = (b) => (b ? "✅" : "🔒");
+  const until = t.unlimited ? "без ограничений" : t.until ? "до " + new Date(t.until * 1000).toLocaleDateString("ru-RU") : t.id === "free" ? "бесплатный" : "бессрочно";
+  const flags = [["analytics", "Аналитика"], ["export", "Экспорт CSV"], ["nl_filter", "Умный фильтр"], ["forward", "Пересылка в чат"], ["reports", "Отчёты"], ["ai_analysis", "AI-анализ"], ["photo_search", "Поиск по фото (в разработке)"]];
+  return '<div class="card"><div class="title">Тариф ' + esc(t.name) + '</div><div class="sub">' + until + "</div><div style=\"margin-top:8px\">" +
+    kvr("Категорий", u.categories + " из " + L.max_categories) + kvr("Профилей поиска", u.profiles + " из " + L.max_profiles) + kvr("Интервал проверки", "от " + L.min_interval + " мин") +
+    kvr("AI-запросов сегодня", u.ai_today + " из " + L.ai_daily + (u.ai_credits ? " (+" + u.ai_credits + " кредитов)" : "")) + kvr("История объявлений", L.history_days + " дн.") + "</div>" +
+    '<div class="chips">' + flags.map((f) => '<span class="chip">' + yes(L[f[0]]) + " " + f[1] + "</span>").join("") + "</div></div>" +
+    (S.tiers.length ? '<div class="card"><div class="title">Тарифы</div>' + S.tiers.map((x) => '<div class="kv"><span><b>' + esc(x.name) + "</b></span><span>" + x.limits.max_categories + " категорий · от " + x.limits.min_interval + " мин · AI " + x.limits.ai_daily + "/день</span></div>").join("") +
+      '<div class="hint">Оплата пока не подключена. Тариф можно получить по промокоду или у владельца.</div></div>' : "") +
+    '<div class="card"><div class="title">Промокод</div><div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:8px"><input class="inp" id="promo" placeholder="Введи промокод"><button class="btn sm" data-act="promoredeem">Применить</button></div></div>';
+}
+
 function viewSettings() {
   const u = S.user, seg = (cur, arr, act) => '<div class="chips big">' + arr.map((a) => '<button class="chip ' + (cur === a[0] ? "sel" : "") + '" data-act="' + act + '" data-v="' + a[0] + '">' + a[1] + "</button>").join("") + "</div>";
   const row = (t, s, on, act) => '<div class="card"><div class="row"><div class="grow"><div class="title">' + t + '</div><div class="sub">' + s + '</div></div><div class="switch ' + (on ? "on" : "") + '" data-act="' + act + '"></div></div></div>';
   return '<div class="h2row"><h2>Настройки</h2><button class="btn ghost sm" data-act="backmore">Назад</button></div>' +
+    tierCard() +
     row("Мониторинг", u.paused ? "Приостановлен, уведомления не приходят" : "Работает, уведомления приходят в чат", !u.paused, "pause") +
     row("Тихий режим", "Уведомления приходят без звука", u.quiet, "quiet") +
     '<div class="card"><div class="title">Интервал по умолчанию</div><div class="sub">Для новых категорий</div>' + seg(u.interval, INTERVALS.map((n) => [n, n + " мин"]), "definterval") + "</div>" +
@@ -295,7 +314,7 @@ function viewSettings() {
 }
 
 /* ───────── Админ-панель (права проверяются на сервере) ───────── */
-const ADM = [["dash", "📈", "Дашборд"], ["users", "👥", "Люди"], ["ai", "🧠", "AI"], ["mon", "📡", "Мониторинг"], ["res", "🛡", "Ресурсы"], ["fin", "💰", "Финансы"], ["bc", "📣", "Рассылки"], ["logs", "📜", "Логи"], ["set", "⚙️", "Настройки"]];
+const ADM = [["dash", "📈", "Дашборд"], ["users", "👥", "Люди"], ["ai", "🧠", "AI"], ["mon", "📡", "Мониторинг"], ["res", "🛡", "Ресурсы"], ["tar", "💳", "Тарифы"], ["fin", "💰", "Финансы"], ["bc", "📣", "Рассылки"], ["logs", "📜", "Логи"], ["set", "⚙️", "Настройки"]];
 const ago = (ts) => { if (ts == null) return "—"; const s = Math.max(0, Math.floor(Date.now() / 1000) - ts); return s < 90 ? s + " с назад" : s < 5400 ? Math.round(s / 60) + " мин назад" : s < 172800 ? Math.round(s / 3600) + " ч назад" : Math.round(s / 86400) + " дн назад"; };
 const kvr = (k, v) => '<div class="kv"><span>' + k + "</span><b>" + v + "</b></div>";
 const pBar = (p) => '<div class="bar"><i class="' + (p >= 0.95 ? "bad" : p >= 0.85 ? "warn2" : p >= 0.7 ? "warn" : "") + '" style="width:' + Math.min(100, Math.round((p || 0) * 100)) + '%"></i></div>';
@@ -307,7 +326,7 @@ function viewAdmin() {
     ADM.map((x) => '<button class="chip ' + (a.sec === x[0] ? "sel" : "") + '" data-act="admsec" data-v="' + x[0] + '">' + x[1] + " " + x[2] + "</button>").join("") + "</div>";
   if (a.err) return head + '<div class="note" style="margin-top:12px">' + esc(a.err) + "</div>";
   if (!a.data) return head + '<div class="center" style="min-height:200px">Загружаю…</div>';
-  return head + '<div style="margin-top:12px">' + ({ dash: admDash, users: admUsers, ai: admAi, mon: admMon, res: admRes, fin: admFin, bc: admBc, logs: admLogs, set: admSet })[a.sec](a.data) + "</div>";
+  return head + '<div style="margin-top:12px">' + ({ dash: admDash, users: admUsers, ai: admAi, mon: admMon, res: admRes, tar: admTar, fin: admFin, bc: admBc, logs: admLogs, set: admSet })[a.sec](a.data) + "</div>";
 }
 
 function admDash(d) {
@@ -320,13 +339,14 @@ function admDash(d) {
     '<div class="card"><div class="title">Отправлено уведомлений</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.sent)) : '<div class="sub">Данных пока мало: счётчики копятся с момента обновления</div>') +
     '<div class="title" style="margin-top:10px">Новые объявления</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.new_ads)) : "") + "</div>" +
     '<div class="card"><div class="title">Статус системы</div>' + kvr("Cron", st.cron_ok ? "✅ работает, запуск " + ago(Math.floor(Date.now() / 1000) - (st.cron_age || 0)) : "⚠️ нет свежих запусков") + kvr("Resource Guard", st.guard ? "порог " + st.guard + "%" : "в норме") + kvr("Технические работы", st.maintenance ? "включены" : "выключены") + "</div>" +
+    '<div class="card"><div class="title">Пользователи по тарифам</div>' + d.by_tier.map((x) => kvr(esc(x.t.toUpperCase()), x.n)).join("") + "</div>" +
     '<div class="card"><div class="title">AI-запросы по провайдерам</div>' + (d.ai_by_provider.length ? d.ai_by_provider.map((p) => kvr(esc(p.provider), p.ok + " из " + p.n + " успешно")).join("") : '<div class="sub">Запросов не было</div>') + "</div>" +
     '<div class="card"><div class="title">Доход и подписки</div><div class="sub">Платежи не подключены, выручки и MRR нет. Выдуманных цифр не показываю.</div></div><div class="hint">' + esc(d.note) + "</div>";
 }
 
 function admUsers(d) {
   return '<div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="search" style="margin:0" id="adq" data-adm="q" placeholder="ID или @username" value="' + esc(S.adm.q) + '"><button class="btn ghost sm" data-act="admsearch">Найти</button></div><div style="height:10px"></div>' +
-    (d.items.length ? d.items.map((u) => '<div class="card" data-act="admuser" data-id="' + u.tg_id + '"><div class="title">' + esc(u.first_name || "—") + (u.username ? " @" + esc(u.username) : "") + (u.blocked ? " 🚫" : "") + '</div><div class="sub">ID ' + u.tg_id + " · был " + ago(u.last_seen) + '</div><div class="chips"><span class="chip">поисков ' + u.cats + '</span><span class="chip">прислано ' + (u.sent_total || 0) + '</span><span class="chip">AI ' + u.ai + "</span>" + (u.paused ? '<span class="chip">пауза</span>' : "") + "</div></div>").join("") : '<div class="empty">Никого не найдено</div>') +
+    (d.items.length ? d.items.map((u) => '<div class="card" data-act="admuser" data-id="' + u.tg_id + '"><div class="title">' + esc(u.first_name || "—") + (u.username ? " @" + esc(u.username) : "") + (u.blocked ? " 🚫" : "") + '</div><div class="sub">ID ' + u.tg_id + " · был " + ago(u.last_seen) + '</div><div class="chips"><span class="chip">поисков ' + u.cats + '</span><span class="chip">прислано ' + (u.sent_total || 0) + '</span><span class="chip">AI ' + u.ai + "</span>" + (u.paused ? '<span class="chip">пауза</span>' : "") + '<span class="chip">' + esc((u.tier || "free").toUpperCase()) + "</span></div></div>").join("") : '<div class="empty">Никого не найдено</div>') +
     (d.next != null ? '<button class="btn ghost" data-act="admmore">Ещё</button>' : "") + '<div class="hint">' + esc(d.tariff_note) + "</div>";
 }
 
@@ -356,7 +376,28 @@ function admRes(d) {
     '<div class="card"><div class="title">Что делает система</div>' + Object.keys(d.actions).map((k) => kvr(k + "%", esc(d.actions[k]))).join("") + '</div><div class="hint">' + esc(d.note) + "</div>";
 }
 
-function admFin(d) { return '<div class="card"><div class="title">Финансы</div><div class="sub" style="margin-top:6px">' + esc(d.message) + "</div></div>"; }
+function admFin(d) {
+  return '<div class="card"><div class="title">Финансы</div><div class="sub" style="margin-top:6px">' + esc(d.message) + '</div></div><div class="card"><div class="title">Пользователи по тарифам</div>' +
+    d.by_tier.map((x) => kvr(esc(x.t.toUpperCase()), x.n)).join("") + kvr("Платные тарифы активны (выданы вручную или по промокоду)", d.manual_active) + kvr("Использований промокодов", d.promo_uses) + "</div>";
+}
+
+function tarCollect(id) {
+  const t = S.adm.data.tiers.find((x) => x.id === id);
+  document.querySelectorAll('[data-tier="' + id + '"]').forEach((el) => { t.limits[el.dataset.key] = Number(el.value); });
+  return t;
+}
+function admTar(d) {
+  const keys = Object.keys(d.spec);
+  return d.tiers.map((t) => '<div class="card"><div class="title">' + esc(t.name) + ' <span class="mini">' + t.id + " · пользователей " + t.users + "</span></div>" +
+    keys.map((k) => { const sp = d.spec[k]; return sp.type === "bool"
+      ? '<div class="row" style="margin-top:10px"><div class="grow">' + esc(sp.label) + '</div><div class="switch ' + (t.limits[k] ? "on" : "") + '" data-act="tarflag" data-t="' + t.id + '" data-k="' + k + '"></div></div>'
+      : '<div class="kv"><span>' + esc(sp.label) + '</span><input class="inp" style="width:90px;padding:6px 10px" inputmode="numeric" data-tier="' + t.id + '" data-key="' + k + '" value="' + t.limits[k] + '"></div>'; }).join("") +
+    '<button class="btn" style="margin-top:12px" data-act="tarsave" data-id="' + t.id + '">Сохранить ' + esc(t.name) + "</button></div>").join("") +
+    '<div class="hint">' + esc(d.note) + '</div><div class="group">Промокоды</div><div class="card"><div class="title">Новый промокод</div><div class="two" style="margin-top:8px"><input class="inp" id="pc-code" placeholder="КОД"><select class="inp" id="pc-tier">' +
+    d.tiers.filter((t) => t.id !== "free").map((t) => '<option value="' + t.id + '">' + esc(t.name) + "</option>").join("") + '</select></div><div class="two" style="margin-top:8px"><input class="inp" id="pc-days" inputmode="numeric" placeholder="дней"><input class="inp" id="pc-max" inputmode="numeric" placeholder="использований"></div>' +
+    '<button class="btn ghost" style="margin-top:8px" data-act="promocreate">Создать</button></div>' +
+    (d.promos || []).map((p) => '<div class="card"><div class="row"><div class="grow"><div class="title mono">' + esc(p.code) + '</div><div class="sub">' + esc(p.tier.toUpperCase()) + " · " + p.days + " дн. · использовано " + p.used + " из " + p.max_uses + '</div></div><div class="switch ' + (p.active ? "on" : "") + '" data-act="promotoggle" data-id="' + esc(p.code) + '"></div></div></div>').join("");
+}
 
 function admBc(d) {
   const a = S.adm, auds = Object.entries(d.audiences);
@@ -410,6 +451,9 @@ function sheetHtml() {
     const d = sh.data;
     inner = !d ? '<div class="center" style="min-height:200px">Загружаю…</div>' : '<div class="title" style="font-size:19px">' + esc(d.user.first_name || "—") + (d.user.username ? " @" + esc(d.user.username) : "") + "</div>" +
       kvr("ID", d.user.tg_id) + kvr("Регистрация", d.user.created_at ? tm(d.user.created_at) : "—") + kvr("Последняя активность", ago(d.user.last_seen)) + kvr("Прислано уведомлений", d.user.sent_total || 0) + kvr("Мониторинг", d.user.paused ? "пауза" : "включён") + kvr("Статус", d.user.blocked ? "🚫 заблокирован" : "активен") +
+      kvr("Тариф", esc(d.tariff.name) + (d.tariff.until ? " до " + new Date(d.tariff.until * 1000).toLocaleDateString("ru-RU") : "")) + kvr("Категорий / профилей", d.usage.categories + " / " + d.usage.profiles) + kvr("AI сегодня / кредиты", d.usage.ai_today + " / " + d.usage.ai_credits) +
+      '<div class="lbl">Выдать тариф</div><div class="two"><select class="inp" id="adt-tier">' + S.tiers.map((x) => '<option value="' + x.id + '"' + (x.id === d.user.tier ? " selected" : "") + ">" + esc(x.name) + "</option>").join("") + '</select><input class="inp" id="adt-days" inputmode="numeric" placeholder="дней (пусто = бессрочно)"></div><button class="btn ghost" style="margin-top:8px" data-act="admtier">Применить тариф</button>' +
+      '<div class="lbl">AI-кредиты и лимиты</div><div style="display:grid;grid-template-columns:1fr auto auto;gap:8px"><input class="inp" id="adt-credits" inputmode="numeric" placeholder="сколько кредитов"><button class="btn ghost sm" data-act="admcredits">Выдать</button><button class="btn ghost sm" data-act="admreset">Сбросить лимиты</button></div>' +
       '<div class="lbl">Поиски</div>' + (d.categories.length ? d.categories.map((c) => kvr(esc(c.title), c.active ? "вкл" : "выкл")).join("") : '<div class="sub">Нет</div>') +
       '<div class="lbl">История активности</div>' + (d.events.length ? d.events.map((e) => '<div class="mini">' + tm(e.ts) + " · " + esc(e.type) + " · " + esc(e.msg) + "</div>").join("") : '<div class="sub">Событий нет</div>') +
       '<div style="margin-top:16px"><button class="btn ' + (d.user.blocked ? "ghost" : "danger") + '" data-act="admblock" data-v="' + (d.user.blocked ? "unblock" : "block") + '">' + (d.user.blocked ? "Разблокировать" : "Заблокировать пользователя") + "</button></div>";
@@ -565,6 +609,14 @@ document.addEventListener("click", (e) => {
       const msg = "Отправить сообщение " + S.adm.bcprev.count + " получателям? Отменить будет нельзя.";
       if (tg && tg.showConfirm) tg.showConfirm(msg, (ok) => ok && go()); else if (confirm(msg)) go();
     },
+    promoredeem: () => run(async () => { const r = await api("promo", { code: $("#promo").value }); await refreshState(); haptic(); toast("Готово! Тариф " + r.name + (r.until ? " до " + new Date(r.until * 1000).toLocaleDateString("ru-RU") : "")); render(); }),
+    tarflag: () => { const t = tarCollect(el.dataset.t); t.limits[el.dataset.k] = !t.limits[el.dataset.k]; render(); },
+    tarsave: () => run(async () => { const t = tarCollect(id); await api("admin/tariffs", { id, limits: t.limits }); haptic(); toast("Тариф " + t.name + " сохранён"); await loadAdmin(); }),
+    promocreate: () => run(async () => { await api("admin/promos", { code: $("#pc-code").value, tier: $("#pc-tier").value, days: $("#pc-days").value, max_uses: $("#pc-max").value }); haptic(); toast("Промокод создан"); await loadAdmin(); }),
+    promotoggle: () => run(async () => { await api("admin/promos", { action: "toggle", code: id }); await loadAdmin(); }),
+    admtier: () => run(async () => { await api("admin/user", { id: Number(sh.id), action: "tier", tier: $("#adt-tier").value, days: $("#adt-days").value }); sh.data = await api("admin/user?id=" + sh.id); haptic(); toast("Тариф изменён"); render(); }),
+    admcredits: () => run(async () => { await api("admin/user", { id: Number(sh.id), action: "credits", amount: $("#adt-credits").value }); sh.data = await api("admin/user?id=" + sh.id); haptic(); toast("Кредиты выданы"); render(); }),
+    admreset: () => run(async () => { await api("admin/user", { id: Number(sh.id), action: "reset_limits" }); sh.data = await api("admin/user?id=" + sh.id); haptic(); toast("Лимиты сброшены"); render(); }),
     logsgo: () => { S.adm.data = null; render(); loadAdmin(); },
     maint: () => run(async () => { await api("admin/settings", { maintenance: !S.adm.data.maintenance }); haptic(); await loadAdmin(); }),
     backmore: () => { S.sub = null; render(); },
@@ -600,10 +652,11 @@ document.addEventListener("click", (e) => {
     }),
     save: () => run(async () => {
       S.saving = true; render();
-      if (sh.type === "add") { await api("subscribe", { category: sh.cat.id, region: sh.region, filters: sh.f, only_new: sh.only_new }); }
-      else { await api("update", { id: sh.id, fields: sh.f }); }
+      let res;
+      if (sh.type === "add") { res = await api("subscribe", { category: sh.cat.id, region: sh.region, filters: sh.f, only_new: sh.only_new }); }
+      else { res = await api("update", { id: sh.id, fields: sh.f }); }
       await refreshState(); S.saving = false; const adding = sh.type === "add"; S.sheet = null; S.sub = null; S.tab = "mine";
-      haptic(); toast(adding ? "Готово! Слежу за новыми объявлениями" : "Сохранено"); render();
+      haptic(); toast((adding ? "Готово! Слежу за новыми объявлениями" : "Сохранено") + (res.interval_adjusted ? ". Интервал поднят до " + res.interval_adjusted + " мин по тарифу" : "")); render();
     }),
     bulksave: () => run(async () => {
       const f = {}; for (const k of ["min_price", "max_price", "city", "keywords", "exclude"]) if (String(sh.f[k]).trim() !== "") f[k] = sh.f[k];

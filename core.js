@@ -117,13 +117,125 @@ export function coreSchema(env) {
     p("CREATE TABLE IF NOT EXISTS ai_analysis(ad_id TEXT PRIMARY KEY, hash TEXT, json TEXT, ts INTEGER)"),
     p("CREATE TABLE IF NOT EXISTS broadcasts(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, text TEXT, audience TEXT, total INTEGER, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT)"),
     p("CREATE TABLE IF NOT EXISTS broadcast_targets(bid INTEGER, tg_id INTEGER, status TEXT DEFAULT 'pending', error TEXT, PRIMARY KEY(bid, tg_id))"),
+    p("CREATE TABLE IF NOT EXISTS tiers(id TEXT PRIMARY KEY, name TEXT, sort INTEGER, limits TEXT)"),
+    p("CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, tier TEXT, days INTEGER, max_uses INTEGER, used INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created INTEGER)"),
+    p("CREATE TABLE IF NOT EXISTS promo_uses(code TEXT, tg_id INTEGER, ts INTEGER, PRIMARY KEY(code, tg_id))"),
+    ...DEFAULT_TIERS.map((t) => p("INSERT OR IGNORE INTO tiers(id,name,sort,limits) VALUES(?,?,?,?)").bind(t.id, t.name, t.sort, JSON.stringify(t.limits))),
   ];
 }
 export const coreAlters = [
   "ALTER TABLE users ADD COLUMN created_at INTEGER", "ALTER TABLE users ADD COLUMN last_seen INTEGER", "ALTER TABLE users ADD COLUMN username TEXT",
   "ALTER TABLE users ADD COLUMN first_name TEXT", "ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0", "ALTER TABLE users ADD COLUMN sent_total INTEGER DEFAULT 0",
   "ALTER TABLE categories ADD COLUMN last_ok INTEGER", "ALTER TABLE categories ADD COLUMN last_error TEXT",
+  "ALTER TABLE users ADD COLUMN tier TEXT DEFAULT 'free'", "ALTER TABLE users ADD COLUMN tier_until INTEGER",
+  "ALTER TABLE users ADD COLUMN ai_credits INTEGER DEFAULT 0", "ALTER TABLE users ADD COLUMN limits_reset INTEGER DEFAULT 0",
 ];
+
+
+// ───────── Тарифная система (оплата не подключена: тарифы выдаёт владелец или промокод) ─────────
+export const LIMIT_SPEC = {
+  max_categories: { type: "int", min: 0, max: 100, label: "Категорий" },
+  max_profiles: { type: "int", min: 1, max: 50, label: "Профилей поиска" },
+  min_interval: { type: "int", min: 1, max: 1440, label: "Мин. интервал, мин" },
+  ai_daily: { type: "int", min: 0, max: 1000, label: "AI-запросов в день" },
+  history_days: { type: "int", min: 1, max: 365, label: "История, дней" },
+  analytics: { type: "bool", label: "Аналитика" },
+  export: { type: "bool", label: "Экспорт CSV" },
+  photo_search: { type: "bool", label: "Поиск по фото (пока не реализован)" },
+  nl_filter: { type: "bool", label: "Умный фильтр" },
+  forward: { type: "bool", label: "Пересылка в чат" },
+  reports: { type: "bool", label: "Отчёты в чат" },
+  ai_analysis: { type: "bool", label: "AI-анализ" },
+};
+export const DEFAULT_TIERS = [
+  { id: "free", name: "FREE", sort: 1, limits: { max_categories: 3, max_profiles: 1, min_interval: 10, ai_daily: 3, history_days: 7, analytics: false, export: false, photo_search: false, nl_filter: false, forward: false, reports: false, ai_analysis: true } },
+  { id: "pro", name: "PRO", sort: 2, limits: { max_categories: 10, max_profiles: 3, min_interval: 5, ai_daily: 20, history_days: 30, analytics: true, export: true, photo_search: false, nl_filter: true, forward: true, reports: true, ai_analysis: true } },
+  { id: "ultra", name: "ULTRA", sort: 3, limits: { max_categories: 25, max_profiles: 8, min_interval: 2, ai_daily: 60, history_days: 90, analytics: true, export: true, photo_search: true, nl_filter: true, forward: true, reports: true, ai_analysis: true } },
+  { id: "business", name: "BUSINESS", sort: 4, limits: { max_categories: 100, max_profiles: 30, min_interval: 1, ai_daily: 200, history_days: 365, analytics: true, export: true, photo_search: true, nl_filter: true, forward: true, reports: true, ai_analysis: true } },
+];
+const UNLIMITED = { max_categories: 100, max_profiles: 50, min_interval: 1, ai_daily: 100000, history_days: 100000, analytics: true, export: true, photo_search: true, nl_filter: true, forward: true, reports: true, ai_analysis: true };
+export const HARD_MAX_CATEGORIES = 100;
+
+let tierCache = { t: 0, v: null };
+export async function getTiers(env) {
+  if (tierCache.v && Date.now() - tierCache.t < 60000) return tierCache.v;
+  const rows = (await env.DB.prepare("SELECT id,name,sort,limits FROM tiers ORDER BY sort").all()).results;
+  const map = new Map();
+  for (const r of rows) {
+    const def = DEFAULT_TIERS.find((d) => d.id === r.id)?.limits || DEFAULT_TIERS[0].limits;
+    let lim = {};
+    try { lim = JSON.parse(r.limits); } catch {}
+    map.set(r.id, { id: r.id, name: r.name, sort: r.sort, limits: { ...def, ...lim } });
+  }
+  tierCache = { t: Date.now(), v: map };
+  return map;
+}
+const isOwnerUser = (env, user) => !!env.OWNER_TELEGRAM_ID && String(user.tg_id) === String(env.OWNER_TELEGRAM_ID);
+export const effectiveTierId = (user, now = Math.floor(Date.now() / 1000)) => (user.tier_until && user.tier_until < now ? "free" : user.tier || "free");
+
+// Действующий тариф и лимиты пользователя. Владелец без ограничений.
+export async function limitsFor(env, user) {
+  if (isOwnerUser(env, user)) return { id: "owner", name: "Владелец", unlimited: true, limits: UNLIMITED, until: null };
+  const tiers = await getTiers(env);
+  const t = tiers.get(effectiveTierId(user)) || tiers.get("free");
+  return { id: t.id, name: t.name, unlimited: false, limits: t.limits, until: user.tier_until || null };
+}
+
+export async function usageFor(env, user) {
+  const dayStart = Math.floor(Date.now() / 86400000) * 86400;
+  const since = Math.max(dayStart, user.limits_reset || 0);
+  const [cats, prof, ai] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) c FROM categories WHERE tg_id=?").bind(user.tg_id).first(),
+    env.DB.prepare("SELECT COUNT(DISTINCT COALESCE(profile,'')) c FROM categories WHERE tg_id=?").bind(user.tg_id).first(),
+    env.DB.prepare("SELECT COUNT(*) c FROM ai_log WHERE tg_id=? AND ok=1 AND ts>=?").bind(user.tg_id, since).first(),
+  ]);
+  return { categories: cats.c, profiles: prof.c, ai_today: ai.c, ai_credits: user.ai_credits || 0 };
+}
+
+// Проверка квоты AI перед запросом и списание кредита после успешного ответа
+export async function aiQuotaCheck(env, tgId, task) {
+  if (tgId == null) return { credit: false };
+  const user = await env.DB.prepare("SELECT * FROM users WHERE tg_id=?").bind(tgId).first();
+  if (!user) return { credit: false };
+  const t = await limitsFor(env, user);
+  const flag = task === "nl" ? "nl_filter" : "ai_analysis";
+  if (!t.limits[flag]) throw new HttpError(`Эта функция недоступна на тарифе ${t.name}. Её можно открыть на более высоком тарифе.`, 403);
+  if (t.unlimited) return { credit: false };
+  const used = (await usageFor(env, user)).ai_today;
+  if (used < t.limits.ai_daily) return { credit: false };
+  if ((user.ai_credits || 0) > 0) return { credit: true };
+  throw new HttpError(`Лимит AI-запросов на сегодня исчерпан (${t.limits.ai_daily} на тарифе ${t.name}). Он обновится в 00:00 UTC.`, 429);
+}
+export async function aiQuotaCommit(env, tgId, q) {
+  if (q?.credit && tgId != null) await env.DB.prepare("UPDATE users SET ai_credits=MAX(0,COALESCE(ai_credits,0)-1) WHERE tg_id=?").bind(tgId).run();
+}
+
+function grantTier(user, tier, days, now) {
+  // продление: если тот же тариф ещё действует, добавляем дни к сроку; иначе отсчёт с сегодняшнего дня
+  const same = effectiveTierId(user, now) === tier && user.tier_until && user.tier_until > now;
+  return days ? (same ? user.tier_until : now) + days * 86400 : null;
+}
+
+export async function redeemPromo(env, uid, rawCode) {
+  const code = String(rawCode || "").trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{3,24}$/.test(code)) throw new HttpError("Неверный формат промокода");
+  const now = Math.floor(Date.now() / 1000);
+  const p = await env.DB.prepare("SELECT * FROM promo_codes WHERE code=?").bind(code).first();
+  if (!p || !p.active) throw new HttpError("Промокод не найден или отключён", 404);
+  if (p.used >= p.max_uses) throw new HttpError("Лимит использований промокода исчерпан");
+  if (await env.DB.prepare("SELECT 1 x FROM promo_uses WHERE code=? AND tg_id=?").bind(code, uid).first()) throw new HttpError("Ты уже использовал этот промокод");
+  const user = await env.DB.prepare("SELECT * FROM users WHERE tg_id=?").bind(uid).first();
+  const until = grantTier(user, p.tier, p.days, now);
+  const claim = await env.DB.prepare("UPDATE promo_codes SET used=used+1 WHERE code=? AND used<max_uses AND active=1").bind(code).run();
+  if (!claim.meta.changes) throw new HttpError("Лимит использований промокода исчерпан");
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO promo_uses(code,tg_id,ts) VALUES(?,?,?)").bind(code, uid, now),
+    env.DB.prepare("UPDATE users SET tier=?, tier_until=? WHERE tg_id=?").bind(p.tier, until, uid),
+  ]);
+  await logEvent(env, "tariff", uid, `промокод ${code}: тариф ${p.tier} на ${p.days} дн.`);
+  const tier = (await getTiers(env)).get(p.tier);
+  return { tier: p.tier, name: tier?.name || p.tier, until };
+}
 
 // ───────── AI Router: только бесплатные провайдеры ─────────
 // Ключи провайдеров хранятся только в Cloudflare Secrets. Workers AI работает через привязку AI без ключа.
@@ -300,6 +412,7 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
     return {
       period, users: users.c, active: active.c, new_users: regs.c, active_searches: cats.c, monitored_users: monitored.c, ads_total: adsTotal.c, totals: tot,
       ai_by_provider: aiBy.results, series, finance: { connected: false },
+      by_tier: (await env.DB.prepare("SELECT CASE WHEN tier_until IS NOT NULL AND tier_until<? THEN 'free' ELSE COALESCE(tier,'free') END t, COUNT(*) n FROM users GROUP BY t").bind(now).all()).results,
       status: { cron_age: cron ? now - cron.ts : null, cron_ok: !!cron && now - cron.ts < 300, guard: g.level, maintenance: (await getSetting(env, "maintenance", "0")) === "1" },
       note: "«Прислано» и «новые объявления» считаются по реально отправленным уведомлениям и сохранённым объявлениям с момента включения учёта.",
     };
@@ -311,10 +424,10 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
     const where = text ? "WHERE CAST(u.tg_id AS TEXT) LIKE ? OR u.username LIKE ?" : "";
     const args = text ? [`%${text}%`, `%${text.replace(/^@/, "")}%`] : [];
     const rows = (await env.DB.prepare(
-      `SELECT u.tg_id, u.username, u.first_name, u.created_at, u.last_seen, u.paused, u.blocked, u.sent_total,
+      `SELECT u.tg_id, u.username, u.first_name, u.created_at, u.last_seen, u.paused, u.blocked, u.sent_total, u.tier, u.tier_until, u.ai_credits,
         (SELECT COUNT(*) FROM categories c WHERE c.tg_id=u.tg_id) cats, (SELECT COUNT(*) FROM ai_log a WHERE a.tg_id=u.tg_id) ai
        FROM users u ${where} ORDER BY COALESCE(u.last_seen,0) DESC LIMIT 30 OFFSET ?`).bind(...args, offset).all()).results;
-    return { items: rows, offset, next: rows.length === 30 ? offset + 30 : null, tariff_note: "Тарифы и лимиты появятся на этапе тарифной системы." };
+    return { items: rows, offset, next: rows.length === 30 ? offset + 30 : null, tariff_note: "Тариф, срок, AI-кредиты и сброс лимитов меняются в карточке пользователя." };
   }
 
   if (sub === "user") {
@@ -328,15 +441,42 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
         await audit(`${body.action === "block" ? "заблокирован" : "разблокирован"} пользователь ${id}`);
         return { ok: true };
       }
+      if (body.action === "tier") {
+        const tiers = await getTiers(env);
+        if (!tiers.has(body.tier)) throw new HttpError("Неизвестный тариф");
+        const days = body.days === "" || body.days == null ? null : Math.floor(Number(body.days));
+        if (days !== null && !(days >= 1 && days <= 3650)) throw new HttpError("Срок: от 1 до 3650 дней или пусто (бессрочно)");
+        const until = days ? now + days * 86400 : null;
+        const r = await env.DB.prepare("UPDATE users SET tier=?, tier_until=? WHERE tg_id=?").bind(body.tier, until, id).run();
+        if (!r.meta.changes) throw new HttpError("Пользователь не найден", 404);
+        await audit(`тариф пользователя ${id}: ${body.tier}${days ? ` на ${days} дн.` : " бессрочно"}`);
+        await logEvent(env, "tariff", id, `тариф ${body.tier}${days ? ` на ${days} дн.` : " бессрочно"} (выдал владелец)`);
+        return { ok: true };
+      }
+      if (body.action === "credits") {
+        const n = Math.floor(Number(body.amount));
+        if (!(n >= 1 && n <= 1000)) throw new HttpError("Кредиты: от 1 до 1000");
+        const r = await env.DB.prepare("UPDATE users SET ai_credits=COALESCE(ai_credits,0)+? WHERE tg_id=?").bind(n, id).run();
+        if (!r.meta.changes) throw new HttpError("Пользователь не найден", 404);
+        await audit(`AI-кредиты пользователю ${id}: +${n}`);
+        return { ok: true };
+      }
+      if (body.action === "reset_limits") {
+        const r = await env.DB.prepare("UPDATE users SET limits_reset=? WHERE tg_id=?").bind(now + 1, id).run();
+        if (!r.meta.changes) throw new HttpError("Пользователь не найден", 404);
+        await audit(`сброшены дневные лимиты пользователя ${id}`);
+        return { ok: true };
+      }
       throw new HttpError("Неизвестное действие");
     }
     const [u, cats, ev] = await Promise.all([
-      env.DB.prepare("SELECT tg_id,username,first_name,created_at,last_seen,paused,blocked,sent_total,quiet,report FROM users WHERE tg_id=?").bind(id).first(),
+      env.DB.prepare("SELECT tg_id,username,first_name,created_at,last_seen,paused,blocked,sent_total,quiet,report,tier,tier_until,ai_credits,limits_reset FROM users WHERE tg_id=?").bind(id).first(),
       env.DB.prepare("SELECT title, active, last_check, last_ok, last_error FROM categories WHERE tg_id=?").bind(id).all(),
       env.DB.prepare("SELECT ts,type,msg FROM events WHERE tg_id=? ORDER BY id DESC LIMIT 30").bind(id).all(),
     ]);
     if (!u) throw new HttpError("Пользователь не найден", 404);
-    return { user: u, categories: cats.results, events: ev.results };
+    const tariff = await limitsFor(env, u), usage = await usageFor(env, u);
+    return { user: u, categories: cats.results, events: ev.results, tariff: { id: tariff.id, name: tariff.name, until: tariff.until, limits: tariff.limits }, usage };
   }
 
   if (sub === "ai") {
@@ -423,8 +563,63 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
     };
   }
 
+  if (sub === "tariffs") {
+    if (method === "POST") {
+      const tiers = await getTiers(env);
+      const t = tiers.get(body.id);
+      if (!t) throw new HttpError("Неизвестный тариф");
+      const next = { ...t.limits };
+      for (const [k, v] of Object.entries(body.limits || {})) {
+        const sp = LIMIT_SPEC[k];
+        if (!sp) throw new HttpError(`Неизвестный лимит: ${k}`);
+        if (sp.type === "bool") next[k] = !!v;
+        else {
+          const n = Math.floor(Number(v));
+          if (!Number.isFinite(n) || n < sp.min || n > sp.max) throw new HttpError(`${sp.label}: от ${sp.min} до ${sp.max}`);
+          next[k] = n;
+        }
+      }
+      const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 20) : t.name;
+      await env.DB.prepare("UPDATE tiers SET name=?, limits=? WHERE id=?").bind(name, JSON.stringify(next), t.id).run();
+      tierCache = { t: 0, v: null };
+      await audit(`тариф ${t.id}: изменены лимиты`);
+      return { ok: true };
+    }
+    const tiers = [...(await getTiers(env)).values()];
+    const counts = (await env.DB.prepare("SELECT CASE WHEN tier_until IS NOT NULL AND tier_until<? THEN 'free' ELSE COALESCE(tier,'free') END t, COUNT(*) n FROM users GROUP BY t").bind(now).all()).results;
+    return { tiers: tiers.map((t) => ({ ...t, users: counts.find((c) => c.t === t.id)?.n || 0 })), spec: LIMIT_SPEC, note: "Лимиты проверяются на сервере. Изменение действует сразу (в течение минуты). Владелец без ограничений. Поиск по фото пока не реализован, флаг подготовлен." };
+  }
+
+  if (sub === "promos") {
+    if (method === "POST") {
+      if (body.action === "toggle") {
+        const r = await env.DB.prepare("UPDATE promo_codes SET active=1-active WHERE code=?").bind(String(body.code || "").toUpperCase()).run();
+        if (!r.meta.changes) throw new HttpError("Промокод не найден", 404);
+        await audit(`промокод ${body.code}: переключён`);
+        return { ok: true };
+      }
+      const code = String(body.code || "").trim().toUpperCase();
+      if (!/^[A-Z0-9_-]{3,24}$/.test(code)) throw new HttpError("Код: 3–24 символа, латиница, цифры, - и _");
+      if (!(await getTiers(env)).has(body.tier) || body.tier === "free") throw new HttpError("Выбери платный тариф");
+      const days = Math.floor(Number(body.days)), max = Math.floor(Number(body.max_uses));
+      if (!(days >= 1 && days <= 365)) throw new HttpError("Срок: от 1 до 365 дней");
+      if (!(max >= 1 && max <= 10000)) throw new HttpError("Число использований: от 1 до 10000");
+      try { await env.DB.prepare("INSERT INTO promo_codes(code,tier,days,max_uses,created) VALUES(?,?,?,?,?)").bind(code, body.tier, days, max, now).run(); }
+      catch { throw new HttpError("Такой промокод уже есть"); }
+      await audit(`создан промокод ${code}: ${body.tier}, ${days} дн., ${max} использований`);
+      return { ok: true };
+    }
+    return { items: (await env.DB.prepare("SELECT code,tier,days,max_uses,used,active,created FROM promo_codes ORDER BY created DESC LIMIT 50").all()).results };
+  }
+
   if (sub === "finance") {
-    return { connected: false, message: "Платёжная система не подключена. Выручки, подписок и платежей нет, и я не показываю выдуманных цифр. Тарифы и оплату подключим отдельным этапом после твоего разрешения." };
+    const byTier = (await env.DB.prepare("SELECT CASE WHEN tier_until IS NOT NULL AND tier_until<? THEN 'free' ELSE COALESCE(tier,'free') END t, COUNT(*) n FROM users GROUP BY t").bind(now).all()).results;
+    const manual = await env.DB.prepare("SELECT COUNT(*) c FROM users WHERE COALESCE(tier,'free')!='free' AND (tier_until IS NULL OR tier_until>=?)").bind(now).first();
+    const promos = await env.DB.prepare("SELECT COUNT(*) c FROM promo_uses").first();
+    return {
+      connected: false, by_tier: byTier, manual_active: manual.c, promo_uses: promos.c,
+      message: "Платёжная система не подключена. Выручки, платежей, возвратов и MRR нет, я не показываю выдуманных цифр. Платные тарифы сейчас выдаются вручную или по промокодам, это не продажи. Оплату подключим отдельным этапом после твоего разрешения.",
+    };
   }
 
   if (sub === "settings") {

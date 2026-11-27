@@ -1,6 +1,6 @@
 // Логика: поиск по словам, оценка выгодности, дубликаты, CSV, AI-анализ (через AI Router из core.js)
 
-import { aiJson, hashStr } from "./core.js";
+import { aiJson, hashStr, aiQuotaCheck, aiQuotaCommit } from "./core.js";
 
 // ───────── Слова: нормализация, синонимы, опечатки ─────────
 const SYN = {
@@ -231,7 +231,9 @@ export async function analyzeAd(env, row, tgId = null) {
     `Название: ${ad.title}\nЦена: ${ad.price ?? "не указана"} BYN\nГород: ${ad.city || "не указан"}\nСостояние (поле объявления): ${ad.cond || "не указано"}\n` +
     `Количество фото: ${ad.photos}\nКоличество указанных параметров: ${ad.params}\nОписание продавца: ${ad.desc || "(пусто)"}\n` +
     `История цены: ${hist.length > 1 ? hist.join(" → ") + " BYN" : "не менялась"}\n${market}`;
+  const quota = await aiQuotaCheck(env, tgId, "analysis"); // кэш выше квоту не тратит
   const j = normalizeAnalysis(await aiJson(env, "analysis", ANALYSIS_SYSTEM, user, { maxTokens: 900, tgId }), sc.n);
+  await aiQuotaCommit(env, tgId, quota);
   await env.DB.prepare("INSERT INTO ai_analysis(ad_id,hash,json,ts) VALUES(?,?,?,?) ON CONFLICT(ad_id) DO UPDATE SET hash=excluded.hash, json=excluded.json, ts=excluded.ts")
     .bind(row.ad_id, hash, JSON.stringify(j), now).run().catch(() => {});
   return j;
@@ -244,8 +246,9 @@ export const aiText = (j) =>
   `<b>Цена:</b> ${escH(j.price_analysis || "—")}\n<b>Состояние:</b> ${escH(j.condition_analysis || "—")}\n\n<b>Не хватает сведений:</b>\n${list(j.missing_information)}\n\n` +
   `<b>Риски (стоит уточнить):</b>\n${list(j.risk_indicators)}\n\n<b>Рекомендация:</b> ${escH(j.recommendation || "—")}\n\n<i>AI читает только текст и числа, фото не анализирует, и может ошибаться.</i>`;
 
-export const parseFilter = (env, text, categories, regions, tgId = null) =>
-  aiJson(
+export async function parseFilter(env, text, categories, regions, tgId = null) {
+  const quota = await aiQuotaCheck(env, tgId, "nl");
+  const j = await aiJson(
     env, "nl",
     "Преобразуй запрос покупателя в фильтр. Доступные категории (id: название): " + categories.map((c) => `${c.id}: ${c.name}`).join("; ") +
       ". Регионы (id: название): " + regions.map((r) => `${r.id}: ${r.name}`).join("; ") +
@@ -253,3 +256,6 @@ export const parseFilter = (env, text, categories, regions, tgId = null) =>
       "В note кратко скажи, что не удалось определить. Не придумывай то, чего нет в запросе.",
     text, { maxTokens: 500, tgId }
   );
+  await aiQuotaCommit(env, tgId, quota);
+  return j;
+}
