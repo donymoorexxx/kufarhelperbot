@@ -117,6 +117,7 @@ export function coreSchema(env) {
     p("CREATE TABLE IF NOT EXISTS ai_analysis(ad_id TEXT PRIMARY KEY, hash TEXT, json TEXT, ts INTEGER)"),
     p("CREATE TABLE IF NOT EXISTS broadcasts(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, text TEXT, audience TEXT, total INTEGER, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT)"),
     p("CREATE TABLE IF NOT EXISTS broadcast_targets(bid INTEGER, tg_id INTEGER, status TEXT DEFAULT 'pending', error TEXT, PRIMARY KEY(bid, tg_id))"),
+    p("CREATE TABLE IF NOT EXISTS ai_queue(ad_id TEXT PRIMARY KEY, ts INTEGER, next_try INTEGER DEFAULT 0, tries INTEGER DEFAULT 0)"),
     p("CREATE TABLE IF NOT EXISTS tiers(id TEXT PRIMARY KEY, name TEXT, sort INTEGER, limits TEXT)"),
     p("CREATE TABLE IF NOT EXISTS promo_codes(code TEXT PRIMARY KEY, tier TEXT, days INTEGER, max_uses INTEGER, used INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created INTEGER)"),
     p("CREATE TABLE IF NOT EXISTS promo_uses(code TEXT, tg_id INTEGER, ts INTEGER, PRIMARY KEY(code, tg_id))"),
@@ -129,6 +130,7 @@ export const coreAlters = [
   "ALTER TABLE categories ADD COLUMN last_ok INTEGER", "ALTER TABLE categories ADD COLUMN last_error TEXT",
   "ALTER TABLE users ADD COLUMN tier TEXT DEFAULT 'free'", "ALTER TABLE users ADD COLUMN tier_until INTEGER",
   "ALTER TABLE users ADD COLUMN ai_credits INTEGER DEFAULT 0", "ALTER TABLE users ADD COLUMN limits_reset INTEGER DEFAULT 0",
+  "ALTER TABLE ads ADD COLUMN ai_score INTEGER", "ALTER TABLE ads ADD COLUMN ai_conf INTEGER", "ALTER TABLE ads ADD COLUMN ai_ts INTEGER",
 ];
 
 
@@ -458,6 +460,7 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
       period, users: users.c, active: active.c, new_users: regs.c, active_searches: cats.c, monitored_users: monitored.c, ads_total: adsTotal.c, totals: tot,
       ai_by_provider: aiBy.results, series, finance: { connected: false },
       by_tier: (await env.DB.prepare("SELECT CASE WHEN tier_until IS NOT NULL AND tier_until<? THEN 'free' ELSE COALESCE(tier,'free') END t, COUNT(*) n FROM users GROUP BY t").bind(now).all()).results,
+      ai_scored: (await env.DB.prepare("SELECT COUNT(*) c FROM ads WHERE ai_score IS NOT NULL").first()).c,
       status: { cron_age: cron ? now - cron.ts : null, cron_ok: !!cron && now - cron.ts < 300, guard: g.level, maintenance: (await getSetting(env, "maintenance", "0")) === "1" },
       note: "«Прислано» и «новые объявления» считаются по реально отправленным уведомлениям и сохранённым объявлениям с момента включения учёта.",
     };
@@ -532,6 +535,12 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
         if (typeof body.model === "string") { await setSetting(env, `ai.model.${body.provider}`, body.model.trim().slice(0, 120)); await audit(`AI: модель ${body.provider} = ${body.model}`); }
         if (body.reset_cooldown) await setSetting(env, `ai.cool.${body.provider}`, "0");
       }
+      if ("auto_enabled" in body) { await setSetting(env, "ai.auto", body.auto_enabled ? "1" : "0"); await audit(`AI: автоанализ ${body.auto_enabled ? "включён" : "выключен"}`); }
+      if ("auto_daily" in body) {
+        const n = Math.floor(Number(body.auto_daily));
+        if (!(n >= 0 && n <= 500)) throw new HttpError("Дневной бюджет автоанализа: от 0 до 500");
+        await setSetting(env, "ai.auto_daily", String(n)); await audit(`AI: бюджет автоанализа ${n} в день`);
+      }
       if (Array.isArray(body.order)) { await setSetting(env, "ai.order", JSON.stringify(body.order.filter((x) => PROVIDERS[x]))); await audit("AI: изменён приоритет провайдеров"); }
       if (body.feature) {
         if (!AI_FEATURES[body.feature]) throw new HttpError("Неизвестная AI-функция");
@@ -551,6 +560,13 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
         d1: { n: s24.n, ok: s24.ok, errors: s24.n - s24.ok, e429: s24.e429, avg_ms: s24.avg ? Math.round(s24.avg) : null }, d7: { n: s7.n, ok: s7.ok, errors: s7.n - s7.ok, e429: s7.e429, avg_ms: s7.avg ? Math.round(s7.avg) : null },
       });
     }
+    const dayStart = Math.floor(Date.now() / 86400000) * 86400;
+    const [queued, doneToday, scored] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) c FROM ai_queue").first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ai_log WHERE task='analysis' AND tg_id IS NULL AND ok=1 AND ts>=?").bind(dayStart).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM ads WHERE ai_score IS NOT NULL").first(),
+    ]);
+    const auto = { enabled: (await getSetting(env, "ai.auto", "1")) !== "0", daily: Number(await getSetting(env, "ai.auto_daily", "40")), done_today: doneToday.c, queued: queued.c, scored: scored.c };
     const [errs, sw, cached, analyses] = await Promise.all([
       env.DB.prepare("SELECT ts,provider,status,err FROM ai_log WHERE ok=0 ORDER BY id DESC LIMIT 15").all(),
       env.DB.prepare("SELECT ts,provider,task FROM ai_log WHERE fallback=1 AND ok=1 ORDER BY id DESC LIMIT 15").all(),
@@ -559,7 +575,7 @@ export async function handleAdmin(env, ownerId, path, method, q, body) {
     ]);
     const features = [];
     for (const f of Object.keys(AI_FEATURES)) features.push({ id: f, name: AI_FEATURES[f], enabled: (await getSetting(env, `ai.feature.${f}`, "1")) !== "0" });
-    return { providers, errors: errs.results, switches: sw.results, cached: cached.c, analyses: analyses.c, features, keys_note: "Ключи провайдеров хранятся в Cloudflare Secrets и здесь не показываются." };
+    return { providers, auto, errors: errs.results, switches: sw.results, cached: cached.c, analyses: analyses.c, features, keys_note: "Ключи провайдеров хранятся в Cloudflare Secrets и здесь не показываются." };
   }
 
   if (sub === "monitoring") {

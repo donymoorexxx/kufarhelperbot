@@ -261,7 +261,7 @@ function viewAnalytics() {
     const days = m.series.map((s) => s.n), avgs = m.series.filter((s) => s.avg != null).map((s, i) => ({ x: i, y: s.avg }));
     return '<div class="card"><div class="title">' + esc(m.title) + '</div><div class="sub">Данные собираются с ' + (m.since ? fmtD(m.since) : "—") + "</div>" +
       '<div style="margin-top:8px"><div class="kv"><span>Объявлений собрано</span><b>' + m.n + '</b></div><div class="kv"><span>Средняя цена</span><b>' + money(m.mean) + '</b></div><div class="kv"><span>Медиана</span><b>' + money(m.median) + '</b></div>' +
-      '<div class="kv"><span>Мин. – макс.</span><b>' + money(m.min) + " – " + money(m.max) + '</b></div><div class="kv"><span>Стандартное отклонение</span><b>' + money(m.std) + '</b></div>' +
+      '<div class="kv"><span>Мин. – макс.</span><b>' + money(m.min) + " – " + money(m.max) + '</b></div><div class="kv"><span>Стандартное отклонение</span><b>' + money(m.std) + '</b></div>' + (m.ai_avg != null ? kvr("Средняя AI-оценка", Math.round(m.ai_avg) + "/100 (" + m.ai_n + " объявл.)") : "") +
       '<div class="kv"><span>Изменение средней цены</span><b>' + (m.change == null ? "мало данных" : pct(m.change)) + '</b></div><div class="kv"><span>Подешевело / подорожало</span><b>' + m.cheaper + " / " + m.pricier + "</b></div></div>" +
       (days.length > 1 ? '<div class="lbl">Новые объявления по дням</div>' + barsSvg(days) : "") + (avgs.length > 1 ? '<div class="lbl">Средняя цена по дням</div>' + lineSvg(avgs) : "") + "</div>";
   }).join("") + '<div class="hint" style="padding:0 6px">Средняя считается по всем собранным объявлениям, медиана — центральное значение отсортированных цен.</div>';
@@ -335,7 +335,7 @@ function admDash(d) {
   return '<div class="chips big" style="margin:0 0 12px">' + per.map((p) => '<button class="chip ' + (S.adm.period === p[0] ? "sel" : "") + '" data-act="admperiod" data-v="' + p[0] + '">' + p[1] + "</button>").join("") + "</div>" +
     '<div class="stats"><div class="stat"><b>' + d.users + '</b><span>пользователей</span></div><div class="stat"><b>' + d.active + '</b><span>активных</span></div><div class="stat"><b>' + d.new_users + "</b><span>новых</span></div></div>" +
     '<div class="card">' + kvr("Активных поисков", d.active_searches) + kvr("Пользователей на мониторинге", d.monitored_users) + kvr("Объявлений в базе", d.ads_total) +
-    kvr("Новых объявлений за период", d.totals.new_ads) + kvr("Уведомлений отправлено", d.totals.sent) + kvr("AI-запросов", d.totals.ai) + kvr("Ошибок", d.totals.errors) + "</div>" +
+    kvr("Новых объявлений за период", d.totals.new_ads) + kvr("Объявлений с AI-оценкой", d.ai_scored) + kvr("Уведомлений отправлено", d.totals.sent) + kvr("AI-запросов", d.totals.ai) + kvr("Ошибок", d.totals.errors) + "</div>" +
     '<div class="card"><div class="title">Отправлено уведомлений</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.sent)) : '<div class="sub">Данных пока мало: счётчики копятся с момента обновления</div>') +
     '<div class="title" style="margin-top:10px">Новые объявления</div>' + (d.series.length > 1 ? barsSvg(d.series.map((s) => s.new_ads)) : "") + "</div>" +
     '<div class="card"><div class="title">Статус системы</div>' + kvr("Cron", st.cron_ok ? "✅ работает, запуск " + ago(Math.floor(Date.now() / 1000) - (st.cron_age || 0)) : "⚠️ нет свежих запусков") + kvr("Resource Guard", st.guard ? "порог " + st.guard + "%" : "в норме") + kvr("Технические работы", st.maintenance ? "включены" : "выключены") + "</div>" +
@@ -352,7 +352,9 @@ function admUsers(d) {
 
 function admAi(d) {
   const st = (x) => x.n + " / " + x.ok + " / " + x.errors + " / " + x.e429;
-  return d.providers.map((p) => '<div class="card"><div class="row"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + (p.configured ? "подключён" : "не подключён (нет ключа или привязки)") + '</div></div><div class="switch ' + (p.enabled ? "on" : "") + '" data-act="aiprov" data-id="' + p.id + '"></div></div>' +
+  return '<div class="card"><div class="row"><div class="grow"><div class="title">Автоанализ новых объявлений</div><div class="sub">В фоне, одно объявление за запуск Cron, в рамках дневного бюджета. Расходует бесплатные квоты, не квоты пользователей</div></div><div class="switch ' + (d.auto.enabled ? "on" : "") + '" data-act="autoai"></div></div>' +
+    '<div style="margin-top:8px">' + kvr("Сегодня проанализировано", d.auto.done_today + " из " + d.auto.daily) + kvr("В очереди", d.auto.queued) + kvr("Всего с AI-оценкой", d.auto.scored) + "</div>" +
+    '<div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:8px"><input class="inp" id="auto-daily" inputmode="numeric" value="' + d.auto.daily + '"><button class="btn ghost sm" data-act="autodaily">Бюджет в день</button></div></div>' + d.providers.map((p) => '<div class="card"><div class="row"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + (p.configured ? "подключён" : "не подключён (нет ключа или привязки)") + '</div></div><div class="switch ' + (p.enabled ? "on" : "") + '" data-act="aiprov" data-id="' + p.id + '"></div></div>' +
     '<div class="mini">' + esc(p.free) + '</div><div class="lbl">Модель</div><div style="display:grid;grid-template-columns:1fr auto;gap:8px"><input class="inp" id="aim-' + p.id + '" value="' + esc(p.model) + '"><button class="btn ghost sm" data-act="aimodel" data-id="' + p.id + '">OK</button></div>' +
     '<div style="margin-top:8px">' + kvr("24 ч: всего / ок / ошибок / 429", st(p.d1)) + kvr("7 дн: всего / ок / ошибок / 429", st(p.d7)) + kvr("Среднее время ответа", p.d7.avg_ms ? p.d7.avg_ms + " мс" : "—") + (p.cooldown_until ? kvr("Пауза до", tm(p.cooldown_until)) : "") + "</div>" +
     '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn ghost sm" data-act="aimove" data-id="' + p.id + '" data-v="up">⬆️ выше</button><button class="btn ghost sm" data-act="aimove" data-id="' + p.id + '" data-v="down">⬇️ ниже</button>' + (p.cooldown_until ? '<button class="btn ghost sm" data-act="aireset" data-id="' + p.id + '">Снять паузу</button>' : "") + "</div></div>").join("") +
@@ -591,6 +593,8 @@ document.addEventListener("click", (e) => {
     admmore: () => { S.adm.offset = S.adm.data.next; S.adm.data = null; render(); loadAdmin(); },
     admuser: () => { S.sheet = { type: "admuser", id, data: null }; render(); api("admin/user?id=" + id).then((d) => { S.sheet.data = d; render(); }).catch((e) => { S.sheet = null; toast(e.message); render(); }); },
     admblock: () => run(async () => { await api("admin/user", { id: Number(sh.id), action: v }); sh.data = await api("admin/user?id=" + sh.id); haptic(); toast(v === "block" ? "Заблокирован" : "Разблокирован"); render(); }),
+    autoai: () => run(async () => { await api("admin/ai", { auto_enabled: !S.adm.data.auto.enabled }); await loadAdmin(); }),
+    autodaily: () => run(async () => { await api("admin/ai", { auto_daily: $("#auto-daily").value }); haptic(); toast("Бюджет сохранён"); await loadAdmin(); }),
     aiprov: () => run(async () => { const p = S.adm.data.providers.find((x) => x.id === id); await api("admin/ai", { provider: id, enabled: !p.enabled }); await loadAdmin(); }),
     aimodel: () => run(async () => { await api("admin/ai", { provider: id, model: $("#aim-" + id).value }); haptic(); toast("Модель сохранена"); await loadAdmin(); }),
     aireset: () => run(async () => { await api("admin/ai", { provider: id, reset_cooldown: true }); await loadAdmin(); }),

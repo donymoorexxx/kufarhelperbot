@@ -1,6 +1,6 @@
 // Логика: поиск по словам, оценка выгодности, дубликаты, CSV, AI-анализ (через AI Router из core.js)
 
-import { aiJson, hashStr, aiQuotaCheck, aiQuotaCommit } from "./core.js";
+import { aiJson, hashStr, aiQuotaCheck, aiQuotaCommit, getSetting, aiAvailable, guardLevel, logEvent } from "./core.js";
 
 // ───────── Слова: нормализация, синонимы, опечатки ─────────
 const SYN = {
@@ -229,7 +229,13 @@ export async function analyzeAd(env, row, tgId = null) {
   const hash = hashStr([ad.title, ad.price, (ad.desc || "").length, Math.floor(analogs.length / 5), hist.join(",")].join("|"));
   const cached = await env.DB.prepare("SELECT hash, json, ts FROM ai_analysis WHERE ad_id=?").bind(row.ad_id).first();
   const now = Math.floor(Date.now() / 1000);
-  if (cached && cached.hash === hash && now - cached.ts < 7 * 86400) { try { return { ...JSON.parse(cached.json), cached: true }; } catch {} }
+  if (cached && cached.hash === hash && now - cached.ts < 7 * 86400) {
+    try {
+      const j = JSON.parse(cached.json);
+      if (row.ai_score == null) await saveAiColumns(env, row.ad_id, j, now);
+      return { ...j, cached: true };
+    } catch {}
+  }
 
   const market = sc.score != null
     ? `Сопоставимых объявлений: ${sc.n}. Средняя цена: ${money(sc.mean)}, медиана: ${money(sc.median)}. Цена объявления отличается на ${pct(sc.devMean)} от средней и на ${pct(sc.dev)} от медианы.`
@@ -243,7 +249,36 @@ export async function analyzeAd(env, row, tgId = null) {
   await aiQuotaCommit(env, tgId, quota);
   await env.DB.prepare("INSERT INTO ai_analysis(ad_id,hash,json,ts) VALUES(?,?,?,?) ON CONFLICT(ad_id) DO UPDATE SET hash=excluded.hash, json=excluded.json, ts=excluded.ts")
     .bind(row.ad_id, hash, JSON.stringify(j), now).run().catch(() => {});
+  await saveAiColumns(env, row.ad_id, j, now); // единая оценка: списки, лучшие находки и аналитика берут её из объявления
   return j;
+}
+
+const saveAiColumns = (env, adId, j, now) =>
+  env.DB.prepare("UPDATE ads SET ai_score=?, ai_conf=?, ai_ts=? WHERE ad_id=?").bind(j.attractiveness_score, j.confidence_score, now, adId).run().catch(() => {});
+
+// Фоновый AI-анализ новых объявлений: одно объявление за запуск Cron, в рамках дневного бюджета и квот провайдеров
+export async function processAiQueue(env) {
+  if ((await getSetting(env, "ai.auto", "1")) === "0") return;
+  if (!(await aiAvailable(env)) || (await guardLevel(env)) >= 70) return;
+  const now = Math.floor(Date.now() / 1000);
+  const budget = Number(await getSetting(env, "ai.auto_daily", "40"));
+  const used = (await env.DB.prepare("SELECT COUNT(*) c FROM ai_log WHERE task='analysis' AND tg_id IS NULL AND ok=1 AND ts>=?").bind(Math.floor(now / 86400) * 86400).first()).c;
+  if (used >= budget) return;
+  const q = await env.DB.prepare("SELECT ad_id, tries FROM ai_queue WHERE next_try<=? ORDER BY ts LIMIT 1").bind(now).first();
+  if (!q) return;
+  const claim = await env.DB.prepare("UPDATE ai_queue SET next_try=? WHERE ad_id=? AND next_try<=?").bind(now + 300, q.ad_id, now).run(); // другой запуск не возьмёт то же
+  if (!claim.meta.changes) return;
+  const row = await env.DB.prepare("SELECT * FROM ads WHERE ad_id=?").bind(q.ad_id).first();
+  if (!row) { await env.DB.prepare("DELETE FROM ai_queue WHERE ad_id=?").bind(q.ad_id).run(); return; }
+  try {
+    await Promise.race([analyzeAd(env, row, null), new Promise((_, rej) => setTimeout(() => rej(new Error("таймаут AI 25 с")), 25000))]);
+    await env.DB.prepare("DELETE FROM ai_queue WHERE ad_id=?").bind(q.ad_id).run();
+  } catch (e) {
+    // не вышло: повторим позже, после 4 неудач бросаем, объявление остаётся с расчётной оценкой
+    if (q.tries + 1 >= 4) await env.DB.prepare("DELETE FROM ai_queue WHERE ad_id=?").bind(q.ad_id).run();
+    else await env.DB.prepare("UPDATE ai_queue SET tries=tries+1, next_try=? WHERE ad_id=?").bind(now + 600 * (q.tries + 1), q.ad_id).run();
+    await logEvent(env, "ai_error", null, `автоанализ ${q.ad_id}: ${e.message}`.slice(0, 300));
+  }
 }
 
 const list = (a) => (a && a.length ? a.map((x) => `• ${escH(x)}`).join("\n") : "—");

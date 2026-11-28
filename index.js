@@ -4,8 +4,7 @@ import APP_HTML from "./app.html";
 import { handleApi } from "./api.js";
 import {
   passes, scoreAd, scoreBlock, priceChangeBlock, findRepost, sigOf, dsigOf, analogsFor,
-  analyzeAd, aiText, rowToAd, money, median,
-} from "./logic.js";
+  analyzeAd, aiText, rowToAd, money, median, processAiQueue } from "./logic.js";
 
 import { withEnv, U, flushUsage, getSetting, setSetting, logEvent, guardInfo, coreSchema, coreAlters, processBroadcasts, limitsFor } from "./core.js";
 
@@ -440,6 +439,7 @@ async function checkCategory(env, cat) {
       U.sent++;
       hist.push(prep(env, "UPDATE users SET sent_total=COALESCE(sent_total,0)+1 WHERE tg_id=?", cat.tg_id));
       hist.push(prep(env, "INSERT OR IGNORE INTO seen VALUES(?,?)", cat.id, ad.id));
+      hist.push(prep(env, "INSERT OR IGNORE INTO ai_queue(ad_id,ts) SELECT ?,? WHERE (SELECT COUNT(*) FROM ai_queue) < 200", ad.id, now)); // AI-оценка в фоне
       hist.push(prep(env, "INSERT INTO history(tg_id,ad_id,title,price,url,ts) VALUES(?,?,?,?,?,?)", cat.tg_id, ad.id, ad.title, priceStr(ad), ad.url, now));
       if (fwd) await sendAd(env, fwd, ad, text, kb([[{ text: "Открыть на Kufar", url: ad.url }]]), true);
     } else if (res.error_code === 403) {
@@ -549,6 +549,7 @@ async function runMonitor(env) {
   }
   if (level < 70) {
     try { await sendReports(env); } catch (e) { console.log("report error", e.message); }
+    try { await processAiQueue(env); } catch (e) { console.log("ai queue error", e.message); }
   }
   if (Math.random() < 0.01) {
     // чистим старое: объявления старше 90 дней (кроме избранного), старые события, метрики и AI-логи
@@ -558,6 +559,7 @@ async function runMonitor(env) {
       prep(env, "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 5000)"),
       prep(env, "DELETE FROM usage WHERE h < ?", new Date((now - 100 * 86400) * 1000).toISOString().slice(0, 13)),
       prep(env, "DELETE FROM ai_log WHERE ts < ?", now - 30 * 86400),
+      prep(env, "DELETE FROM ai_queue WHERE ad_id NOT IN (SELECT ad_id FROM ads)"),
     ]).catch((e) => console.log("cleanup", e.message));
   }
   // Предупреждение владельцу при 70/85/95% дневного лимита (по одному разу на уровень в сутки)

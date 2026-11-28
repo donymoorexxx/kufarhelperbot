@@ -78,7 +78,7 @@ async function verifyInitData(initData, botToken) {
   if (Date.now() / 1000 - Number(params.get("auth_date") || 0) > 86400) throw new HttpError("Сессия устарела, закрой и открой приложение заново", 401);
   const user = JSON.parse(params.get("user") || "null");
   if (!user?.id) throw new HttpError("Нет пользователя", 401);
-  return user;
+  return Object.assign(user, { _age: Date.now() / 1000 - Number(params.get("auth_date") || 0) });
 }
 
 // ───────── Проверка полей ─────────
@@ -185,6 +185,7 @@ export async function handleApi(request, env, url, H) {
     const q = url.searchParams;
 
     if (path.startsWith("/api/admin/")) {
+      if (owner && tgUser._age > 7200) throw new HttpError("Сессия администратора устарела (больше 2 часов). Закрой и открой приложение заново.", 401);
       if (!owner) {
         await logEvent(env, "security", uid, `попытка доступа к админке: ${path}`);
         throw new HttpError("Нет доступа", 403);
@@ -349,20 +350,22 @@ export async function handleApi(request, env, url, H) {
       if (text) {
         rows = rows.filter((r) => { const tt = tokens(r.title); return text.split(",").some((p) => phraseMatch(tt, p)); });
       }
+      // единая оценка: AI-оценка, если есть и достоверна, иначе расчётная по аналогам
       const items = rows.map((r) => ({
-        id: r.ad_id, title: r.title, price: r.price, city: r.city, url: r.url, photo: r.photo, score: r.score, dev: r.dev,
+        id: r.ad_id, title: r.title, price: r.price, city: r.city, url: r.url, photo: r.photo, dev: r.dev,
+        ...(r.ai_score != null && r.ai_conf >= 30 ? { score: r.ai_score, src: "ai", conf: r.ai_conf } : { score: r.score, src: "calc", conf: null }),
         first_seen: r.first_seen, list_time: r.list_time, seller: r.seller, fav: !!r.fav, photos: r.photos,
         drop: drops.has(r.ad_id) && r.price != null && r.price < drops.get(r.ad_id) * 0.97,
       }));
       let list = items;
       if (mode === "best") {
         // сомнительные предложения в топ не попадают: нужна оценка, фото и цена не «слишком хороша»
-        list = items.filter((i) => (i.score != null && i.score >= 60 && i.photos > 0 && !(i.dev != null && i.dev < -0.6)) || i.drop);
+        list = items.filter((i) => (i.score != null && i.score >= 60 && i.photos > 0 && !(i.dev != null && i.dev < -0.6) && (i.src !== "ai" || i.conf >= 40)) || i.drop);
       }
       const by = {
         date: (a, b) => b.first_seen - a.first_seen,
         price: (a, b) => (a.price ?? 1e12) - (b.price ?? 1e12),
-        score: (a, b) => (b.score ?? -1) - (a.score ?? -1),
+        score: (a, b) => (b.score ?? -1) - (a.score ?? -1) || (b.conf ?? 0) - (a.conf ?? 0),
         dev: (a, b) => (a.dev ?? 9) - (b.dev ?? 9),
       }[sort];
       return json({ items: list.sort(by).slice(0, limit), total: list.length });
@@ -383,7 +386,8 @@ export async function handleApi(request, env, url, H) {
         .slice(0, 5);
       const nearUrls = nearest.length ? await all(env, `SELECT ad_id,url FROM ads WHERE ad_id IN (${nearest.map(() => "?").join(",")})`, ...nearest.map((n) => n.ad_id)) : [];
       const urlOf = new Map(nearUrls.map((r) => [r.ad_id, r.url]));
-      const [history, seller, fav] = await Promise.all([
+      const [aiRow, history, seller, fav] = await Promise.all([
+        one(env, "SELECT json FROM ai_analysis WHERE ad_id=?", row.ad_id),
         all(env, "SELECT price, ts FROM price_hist WHERE ad_id=? ORDER BY ts", row.ad_id),
         row.seller
           ? all(env, "SELECT ad_id,title,price,url,first_seen FROM ads WHERE seller=? ORDER BY first_seen DESC LIMIT 8", row.seller)
@@ -391,7 +395,8 @@ export async function handleApi(request, env, url, H) {
         one(env, "SELECT note, price0, added FROM favs WHERE tg_id=? AND ad_id=?", uid, row.ad_id),
       ]);
       return json({
-        ad: { ...ad, first_seen: row.first_seen, score: row.score, dup_of: row.dup_of },
+        ad: { ...ad, first_seen: row.first_seen, score: row.score, dup_of: row.dup_of, ai_score: row.ai_score, ai_conf: row.ai_conf },
+        ai_html: aiRow ? (() => { try { return H.aiText({ ...JSON.parse(aiRow.json), cached: true }); } catch { return null; } })() : null,
         score: sc,
         analogs: { n: analogs.length, nearest: nearest.map((n) => ({ title: n.title, price: n.price, url: urlOf.get(n.ad_id) })) },
         history, seller: row.seller ? { id: row.seller, ads: seller } : null, fav,
@@ -430,11 +435,12 @@ export async function handleApi(request, env, url, H) {
       for (const c of cats) if (!markets.has(marketOf(c))) markets.set(marketOf(c), c.title);
       const out = [];
       for (const [market, title] of [...markets].slice(0, 8)) {
-        const [rows, prev, moves, first] = await Promise.all([
+        const [rows, prev, moves, first, aiAvg] = await Promise.all([
           all(env, "SELECT price, first_seen FROM ads WHERE market=? AND first_seen>=? LIMIT 3000", market, since),
           one(env, "SELECT AVG(price) a, COUNT(price) n FROM ads WHERE market=? AND price>0 AND first_seen>=? AND first_seen<?", market, since - days * 86400, since),
           all(env, "SELECT p.ad_id, p.price FROM price_hist p JOIN ads a ON a.ad_id=p.ad_id WHERE a.market=? AND p.ts>=? ORDER BY p.ad_id, p.ts LIMIT 5000", market, since),
           one(env, "SELECT MIN(first_seen) t FROM ads WHERE market=?", market),
+          one(env, "SELECT AVG(ai_score) a, COUNT(ai_score) n FROM ads WHERE market=? AND first_seen>=? AND ai_score IS NOT NULL", market, since),
         ]);
         const prices = rows.map((r) => r.price).filter((p) => p > 0);
         const byDay = new Map();
@@ -454,7 +460,7 @@ export async function handleApi(request, env, url, H) {
           market, title, n: rows.length, priced: prices.length,
           mean: avg, median: median(prices), min: prices.length ? Math.min(...prices) : null, max: prices.length ? Math.max(...prices) : null, std: stdev(prices),
           prevMean: prev.n >= 5 ? prev.a : null, change: prev.n >= 5 && avg != null ? (avg - prev.a) / prev.a : null,
-          cheaper, pricier, since: first.t,
+          cheaper, pricier, since: first.t, ai_avg: aiAvg.n ? aiAvg.a : null, ai_n: aiAvg.n,
           series: [...byDay.values()].sort((a, b) => (a.d < b.d ? -1 : 1)).map((e) => ({ d: e.d, n: e.n, avg: e.np ? e.sum / e.np : null })),
         });
       }
